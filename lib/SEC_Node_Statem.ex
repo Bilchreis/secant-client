@@ -721,19 +721,35 @@ defmodule NodeTable do
 
   @lookup_table :node_table_lookup
 
-  def start(node_id) do
-    case :ets.whereis(:node_table_lookup) do
-      :undefined -> :ets.new(@lookup_table, [:set, :public, :named_table])
-      _ -> {:ok}
-    end
-
-    # Create an ETS table with the table name as an atom
-    table = :ets.new(:ets_table, [:set, :public])
-
-    true = :ets.insert(@lookup_table, {node_id, table})
-
-    {:ok, table}
+  def init_lookup_table do
+    :ets.new(@lookup_table, [:set, :public, :named_table])
+    :ok
+  rescue
+    ArgumentError ->
+      :ok
   end
+
+  def start(node_id) do
+    case :ets.lookup(@lookup_table, node_id) do
+      [{_, table}] ->
+        {:ok, table}
+
+      [] ->
+        table = :ets.new(:ets_table, [:set, :public])
+
+        case :ets.insert_new(@lookup_table, {node_id, table}) do
+          true ->
+            {:ok, table}
+
+          false ->
+            :ets.delete(table)
+            get_table(node_id)
+        end
+    end
+  end
+
+
+
 
   def insert(node_id, key, value) do
     {:ok, table} = get_table(node_id)
@@ -760,7 +776,9 @@ defmodule NodeTable do
   defp get_table(node_id) do
     case :ets.lookup(@lookup_table, node_id) do
       [{_, table}] -> {:ok, table}
-      [] -> {:error, :notfound}
+      [] ->
+        Logger.error("Lookup for node_id #{inspect(node_id)} failed - no table found")
+        {:error, :notfound}
     end
   end
 end
