@@ -48,8 +48,14 @@ defmodule TcpConnection do
 
   @impl :gen_statem
   def handle_event(:internal, :connect, :disconnected, %{host: host, port: port} = state) do
-    case :gen_tcp.connect(state.host, state.port, [:binary, active: true]) do
+    case :gen_tcp.connect(state.host, state.port, [:binary, active: true, keepalive: true]) do
       {:ok, socket} ->
+        # TCP_KEEPIDLE=30s, TCP_KEEPINTVL=10s, TCP_KEEPCNT=3 (Linux: SOL_TCP=6, opts 4/5/6)
+        # Dead connection detected within ~60s; setopts returns {:error,_} on non-Linux, safe to ignore
+        :inet.setopts(socket, [{:raw, 6, 4, <<30::native-32>>}])
+        :inet.setopts(socket, [{:raw, 6, 5, <<10::native-32>>}])
+        :inet.setopts(socket, [{:raw, 6, 6, <<3::native-32>>}])
+
         Registry.dispatch(Registry.SEC_Node_Statem, {host, port}, fn entries ->
           for {pid, _} <- entries, do: send(pid, :socket_connected)
         end)

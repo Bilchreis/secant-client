@@ -1,0 +1,6 @@
+services:
+
+  secop_client:
+    build: .
+    restart: always
+    network_mode: host
