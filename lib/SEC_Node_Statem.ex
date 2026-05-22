@@ -484,25 +484,31 @@ defmodule SEC_Node_Statem do
   end
 
   def handle_event({:timeout, :inactivity_ping}, nil, :initialized, %{node_id: node_id} = state) do
-    id = Integer.to_string(:rand.uniform(100_000))
-    message = "ping #{id}\n"
-    Logger.debug("Inactivity probe: sending ping #{id} to #{inspect(node_id)}")
-    TcpConnection.send_message(node_id, String.to_charlist(message))
+    case TcpConnection.last_activity_ms(node_id) do
+      elapsed when is_integer(elapsed) and elapsed < @inactivity_timeout ->
+        {:keep_state_and_data, {{:timeout, :inactivity_ping}, @inactivity_timeout - elapsed, nil}}
 
-    receive do
-      {:pong, ^id, _data} ->
-        Logger.debug("Inactivity probe: pong #{id} received from #{inspect(node_id)}")
-        {:keep_state_and_data, {{:timeout, :inactivity_ping}, @inactivity_timeout, nil}}
+      _ ->
+        id = Integer.to_string(:rand.uniform(100_000))
+        message = "ping #{id}\n"
+        Logger.debug("Inactivity probe: sending ping #{id} to #{inspect(node_id)}")
+        TcpConnection.send_message(node_id, String.to_charlist(message))
 
-      {:error_ping, _specifier, _error_class, error_text, _error_dict} ->
-        Logger.warning("Inactivity probe ping error for #{inspect(node_id)}: #{error_text}")
-        {:keep_state_and_data, {{:timeout, :inactivity_ping}, @inactivity_timeout, nil}}
-    after
-      5_000 ->
-        Logger.warning("Inactivity probe timed out for #{inspect(node_id)}, triggering reconnect")
-        updated_state = %{state | state: :disconnected}
-        publish_statechange(updated_state, state.pubsub_topic)
-        {:next_state, :disconnected, updated_state, {:next_event, :internal, :connect}}
+        receive do
+          {:pong, ^id, _data} ->
+            Logger.debug("Inactivity probe: pong #{id} received from #{inspect(node_id)}")
+            {:keep_state_and_data, {{:timeout, :inactivity_ping}, @inactivity_timeout, nil}}
+
+          {:error_ping, _specifier, _error_class, error_text, _error_dict} ->
+            Logger.warning("Inactivity probe ping error for #{inspect(node_id)}: #{error_text}")
+            {:keep_state_and_data, {{:timeout, :inactivity_ping}, @inactivity_timeout, nil}}
+        after
+          5_000 ->
+            Logger.warning("Inactivity probe timed out for #{inspect(node_id)}, triggering reconnect")
+            updated_state = %{state | state: :disconnected}
+            publish_statechange(updated_state, state.pubsub_topic)
+            {:next_state, :disconnected, updated_state, {:next_event, :internal, :connect}}
+        end
     end
   end
 
@@ -510,29 +516,21 @@ defmodule SEC_Node_Statem do
     {:keep_state_and_data, []}
   end
 
-  def handle_event(:info, :server_activity, :initialized, _state) do
-    {:keep_state_and_data, {{:timeout, :inactivity_ping}, @inactivity_timeout, nil}}
-  end
-
-  def handle_event(:info, :server_activity, _state_name, _state) do
-    {:keep_state_and_data, []}
-  end
-
   def handle_event(:info, {:active}, :initialized, state) do
     Logger.warning("received async ACTIVE message")
     updated_state = %{state | active: true}
-    {:keep_state, updated_state, {{:timeout, :inactivity_ping}, @inactivity_timeout, nil}}
+    {:keep_state, updated_state}
   end
 
   def handle_event(:info, {:inactive}, :initialized, state) do
     Logger.warning("received async INACTIVE message")
     updated_state = %{state | active: false}
-    {:keep_state, updated_state, {{:timeout, :inactivity_ping}, @inactivity_timeout, nil}}
+    {:keep_state, updated_state}
   end
 
   def handle_event(:info, {:pong, id, data}, :initialized, _state) do
     Logger.warning("received async PONG message id:#{id}, data:#{data}")
-    {:keep_state_and_data, {{:timeout, :inactivity_ping}, @inactivity_timeout, nil}}
+    {:keep_state_and_data}
   end
 
   def handle_event(
@@ -547,7 +545,7 @@ defmodule SEC_Node_Statem do
       # Notihng changed, probably just a network disconnect
       %{changed: :equal, value: _} ->
         Logger.warning("received async Description: data constant")
-        {:keep_state_and_data, {{:timeout, :inactivity_ping}, @inactivity_timeout, nil}}
+        {:keep_state_and_data}
 
       # Description changed update uuid, equipment_id and description
       _ ->
@@ -560,23 +558,23 @@ defmodule SEC_Node_Statem do
             equipment_id: equipment_id
         }
 
-        {:keep_state, updated_state_descr, {{:timeout, :inactivity_ping}, @inactivity_timeout, nil}}
+        {:keep_state, updated_state_descr}
     end
   end
 
   def handle_event(:info, {:done, module, command, data_report}, :initialized, _state) do
     Logger.warning("received async DONE message #{module}:#{command} data: #{data_report}")
-    {:keep_state_and_data, {{:timeout, :inactivity_ping}, @inactivity_timeout, nil}}
+    {:keep_state_and_data}
   end
 
   def handle_event(:info, {:reply, module, parameter, data_report}, :initialized, _state) do
     Logger.warning("received async REPLY message #{module}:#{parameter} data: #{data_report}")
-    {:keep_state_and_data, {{:timeout, :inactivity_ping}, @inactivity_timeout, nil}}
+    {:keep_state_and_data}
   end
 
   def handle_event(:info, {:changed, module, parameter, data_report}, :initialized, _state) do
     Logger.warning("received async CHANGED message #{module}:#{parameter} data: #{data_report}")
-    {:keep_state_and_data, {{:timeout, :inactivity_ping}, @inactivity_timeout, nil}}
+    {:keep_state_and_data}
   end
 
   defp send_describe_message(node_id) do

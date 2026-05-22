@@ -76,10 +76,6 @@ defmodule SECoP_Parser do
   def update(node_id, specifier, data) do
     Logger.debug("Update message received. Specifier: #{specifier}, Data: #{data}")
     data_to_ets(node_id, specifier, data)
-
-    Registry.dispatch(Registry.SEC_Node_Statem, node_id, fn entries ->
-      for {pid, _} <- entries, do: send(pid, :server_activity)
-    end)
   end
 
   def describe(node_id, specifier, data) do
@@ -250,10 +246,6 @@ defmodule SECoP_Parser do
       "error_update:#{elem(node_id, 0)}:#{elem(node_id, 1)}",
       {:error_update, module, accessible, error_report}
     )
-
-    Registry.dispatch(Registry.SEC_Node_Statem, node_id, fn entries ->
-      for {pid, _} <- entries, do: send(pid, :server_activity)
-    end)
   end
 
   def error_response(error_code, node_id, specifier, error_report) do

@@ -40,7 +40,8 @@ defmodule TcpConnection do
       host: opts[:host],
       port: opts[:port],
       socket: nil,
-      reconnect_backoff: opts[:reconnect_backoff] || 500
+      reconnect_backoff: opts[:reconnect_backoff] || 500,
+      last_activity: nil
     }
 
     {:ok, @initial_state, state, {:next_event, :internal, :connect}}
@@ -77,8 +78,7 @@ defmodule TcpConnection do
     [{buffer_pid, _value}] = Registry.lookup(Registry.Buffer, {host, port})
     Buffer.receive(buffer_pid, data)
 
-    # Update the buffer with remaining data
-    {:keep_state, state}
+    {:keep_state, %{state | last_activity: System.monotonic_time(:millisecond)}}
   end
 
   def handle_event(:info, {:tcp_closed, _socket}, :connected, %{host: host, port: port} = state) do
@@ -135,6 +135,12 @@ defmodule TcpConnection do
     {:keep_state, state}
   end
 
+  def handle_event({:call, from}, :last_activity, _state_name, %{last_activity: t} = state) do
+    elapsed = if t, do: System.monotonic_time(:millisecond) - t, else: :infinity
+    :gen_statem.reply(from, elapsed)
+    {:keep_state, state}
+  end
+
   def handle_event({:call, from}, :stop, _state, %{host: host, port: port} = state) do
     # Close socket if connected
     if state.socket, do: :gen_tcp.close(state.socket)
@@ -152,6 +158,11 @@ defmodule TcpConnection do
   def is_connected(node_id) do
     [{conn_pid, _value}] = Registry.lookup(Registry.TcpConnection, node_id)
     :gen_statem.call(conn_pid, :is_connected)
+  end
+
+  def last_activity_ms(node_id) do
+    [{conn_pid, _value}] = Registry.lookup(Registry.TcpConnection, node_id)
+    :gen_statem.call(conn_pid, :last_activity)
   end
 
   def send_message(node_id, data) do
