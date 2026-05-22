@@ -230,7 +230,7 @@ defmodule SEC_Node_Statem do
             publish_statechange(updated_state, state.pubsub_topic)
             {:next_state, :initialized, updated_state, [
               {:next_event, :internal, :activate},
-              {{:timeout, :inactivity_ping}, @inactivity_timeout, nil}
+              {{:timeout, :inactivity_check}, @inactivity_timeout, nil}
             ]}
 
           # Description changed update uuid, equipment_id and description
@@ -252,7 +252,7 @@ defmodule SEC_Node_Statem do
             publish_statechange(updated_state_descr, state.pubsub_topic)
             {:next_state, :initialized, updated_state_descr, [
               {:next_event, :internal, :activate},
-              {{:timeout, :inactivity_ping}, @inactivity_timeout, nil}
+              {{:timeout, :inactivity_check}, @inactivity_timeout, nil}
             ]}
         end
 
@@ -483,36 +483,42 @@ defmodule SEC_Node_Statem do
     end
   end
 
-  def handle_event({:timeout, :inactivity_ping}, nil, :initialized, %{node_id: node_id} = state) do
-    case TcpConnection.last_activity_ms(node_id) do
-      elapsed when is_integer(elapsed) and elapsed < @inactivity_timeout ->
-        {:keep_state_and_data, {{:timeout, :inactivity_ping}, @inactivity_timeout - elapsed, nil}}
+  def handle_event({:timeout, :inactivity_check}, nil, :initialized, %{node_id: node_id} = state) do
+    now = System.monotonic_time(:millisecond)
 
-      _ ->
-        id = Integer.to_string(:rand.uniform(100_000))
-        message = "ping #{id}\n"
-        Logger.debug("Inactivity probe: sending ping #{id} to #{inspect(node_id)}")
-        TcpConnection.send_message(node_id, String.to_charlist(message))
+    stale? =
+      case NodeTable.lookup(node_id, :last_update_timestamp) do
+        {:ok, ts} -> now - ts >= @inactivity_timeout
+        {:error, _} -> true
+      end
 
-        receive do
-          {:pong, ^id, _data} ->
-            Logger.debug("Inactivity probe: pong #{id} received from #{inspect(node_id)}")
-            {:keep_state_and_data, {{:timeout, :inactivity_ping}, @inactivity_timeout, nil}}
+    if stale? do
+      id = Integer.to_string(:rand.uniform(100_000))
+      message = "ping #{id}\n"
+      Logger.debug("Inactivity check: sending ping #{id} to #{inspect(node_id)}")
+      TcpConnection.send_message(node_id, String.to_charlist(message))
 
-          {:error_ping, _specifier, _error_class, error_text, _error_dict} ->
-            Logger.warning("Inactivity probe ping error for #{inspect(node_id)}: #{error_text}")
-            {:keep_state_and_data, {{:timeout, :inactivity_ping}, @inactivity_timeout, nil}}
-        after
-          5_000 ->
-            Logger.warning("Inactivity probe timed out for #{inspect(node_id)}, triggering reconnect")
-            updated_state = %{state | state: :disconnected}
-            publish_statechange(updated_state, state.pubsub_topic)
-            {:next_state, :disconnected, updated_state, {:next_event, :internal, :connect}}
-        end
+      receive do
+        {:pong, ^id, _data} ->
+          Logger.debug("Inactivity check: pong #{id} received from #{inspect(node_id)}")
+          {:keep_state_and_data, {{:timeout, :inactivity_check}, @inactivity_timeout, nil}}
+
+        {:error_ping, _specifier, _error_class, error_text, _error_dict} ->
+          Logger.warning("Inactivity check ping error for #{inspect(node_id)}: #{error_text}")
+          {:keep_state_and_data, {{:timeout, :inactivity_check}, @inactivity_timeout, nil}}
+      after
+        5_000 ->
+          Logger.warning("Inactivity check timed out for #{inspect(node_id)}, triggering reconnect")
+          updated_state = %{state | state: :disconnected}
+          publish_statechange(updated_state, state.pubsub_topic)
+          {:next_state, :disconnected, updated_state, {:next_event, :internal, :connect}}
+      end
+    else
+      {:keep_state_and_data, {{:timeout, :inactivity_check}, @inactivity_timeout, nil}}
     end
   end
 
-  def handle_event({:timeout, :inactivity_ping}, nil, _state_name, _state) do
+  def handle_event({:timeout, :inactivity_check}, nil, _state_name, _state) do
     {:keep_state_and_data, []}
   end
 

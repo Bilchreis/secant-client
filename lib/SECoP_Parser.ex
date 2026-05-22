@@ -76,6 +76,7 @@ defmodule SECoP_Parser do
   def update(node_id, specifier, data) do
     Logger.debug("Update message received. Specifier: #{specifier}, Data: #{data}")
     data_to_ets(node_id, specifier, data)
+    NodeTable.insert(node_id, :last_update_timestamp, System.monotonic_time(:millisecond))
   end
 
   def describe(node_id, specifier, data) do
