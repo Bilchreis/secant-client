@@ -94,7 +94,8 @@ defmodule SEC_Node_Statem do
       uuid: Ecto.UUID.generate(),
       error: false,
       state: :disconnected,
-      manual: opts[:manual] || false
+      manual: opts[:manual] || false,
+      last_seen_update_ts: nil
     }
 
     Logger.info("Starting SEC Node State Machine for: #{opts[:host]}:#{opts[:port]}")
@@ -483,16 +484,14 @@ defmodule SEC_Node_Statem do
     end
   end
 
-  def handle_event({:timeout, :inactivity_check}, nil, :initialized, %{node_id: node_id} = state) do
-    now = System.monotonic_time(:millisecond)
-
-    stale? =
+  def handle_event({:timeout, :inactivity_check}, nil, :initialized, %{node_id: node_id, last_seen_update_ts: last_seen} = state) do
+    current_ts =
       case NodeTable.lookup(node_id, :last_update_timestamp) do
-        {:ok, ts} -> now - ts >= @inactivity_timeout
-        {:error, _} -> true
+        {:ok, ts} -> ts
+        {:error, _} -> nil
       end
 
-    if stale? do
+    if current_ts == last_seen do
       id = Integer.to_string(:rand.uniform(100_000))
       message = "ping #{id}\n"
       Logger.debug("Inactivity check: sending ping #{id} to #{inspect(node_id)}")
@@ -514,7 +513,8 @@ defmodule SEC_Node_Statem do
           {:next_state, :disconnected, updated_state, {:next_event, :internal, :connect}}
       end
     else
-      {:keep_state_and_data, {{:timeout, :inactivity_check}, @inactivity_timeout, nil}}
+      {:keep_state, %{state | last_seen_update_ts: current_ts},
+       {{:timeout, :inactivity_check}, @inactivity_timeout, nil}}
     end
   end
 
