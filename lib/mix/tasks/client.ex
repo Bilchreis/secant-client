@@ -10,19 +10,19 @@ defmodule Mix.Tasks.Client do
     Mix.Task.run("app.start")
 
 
-    opts = %{
-      host: "localhost" |> String.to_charlist(),
-      port: 2055,
-      reconnect_backoff: 5000,
-      manual: true
-    }
+    # opts = %{
+    #   host: "192.168.178.75" |> String.to_charlist(),
+    #   port: 10900,
+    #   reconnect_backoff: 5000,
+    #   manual: true
+    # }
 
-    SEC_Node_Supervisor.start_child(opts)
+    # SEC_Node_Supervisor.start_child(opts)
 
-    Process.sleep(3000)
+    # Process.sleep(3000)
 
 
-    node_map = SEC_Node_Supervisor.get_active_nodes()
+    # node_map = SEC_Node_Supervisor.get_active_nodes()
 
 
 
