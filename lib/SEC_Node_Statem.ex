@@ -4,15 +4,17 @@ defmodule SEC_Node_Statem do
   alias Ecto
   alias TcpConnection
 
-
   @behaviour :gen_statem
 
   @initial_state :connecting
-  @inactivity_timeout 30_000
+  @tcp_module Application.compile_env(:secop_client, :tcp_connection_module, TcpConnection)
+  @inactivity_timeout Application.compile_env(:secop_client, :inactivity_timeout, 15_000)
+  @reconnect_timeout Application.compile_env(:secop_client, :reconnect_timeout, 5_000)
+  @call_timeout Application.compile_env(:secop_client, :call_timeout, 5_000)
+  @handshake_timeout Application.compile_env(:secop_client, :handshake_timeout, 15_000)
 
   # Public
   def start_link(opts) do
-
     :gen_statem.start_link(
       {:via, Registry, {Registry.SEC_Node_Statem, {opts[:host], opts[:port]}}},
       __MODULE__,
@@ -106,7 +108,7 @@ defmodule SEC_Node_Statem do
 
   @impl :gen_statem
   def handle_event(:internal, :connect, :connecting, %{node_id: node_id, manual: manual} = state) do
-    case TcpConnection.is_connected(node_id) do
+    case @tcp_module.is_connected(node_id) do
       true ->
         updated_state = %{state | state: :connected}
         NodeTable.start(state.node_id)
@@ -115,28 +117,32 @@ defmodule SEC_Node_Statem do
 
       false ->
         if manual do
-          Logger.warning("Manual connection failed!! stopping all services for: #{inspect(node_id)}")
+          Logger.warning(
+            "Manual connection failed!! stopping all services for: #{inspect(node_id)}"
+          )
+
           publish_new_node(:connection_failed, state.pubsub_topic)
           SEC_Node_Services.stop(node_id)
           {:stop, :normal}
         else
           updated_state = %{state | state: :disconnected}
           publish_statechange(updated_state, state.pubsub_topic)
-          {:next_state, :disconnected, updated_state, {{:timeout, :reconnect}, 5000, nil}}
+
+          {:next_state, :disconnected, updated_state,
+           {{:timeout, :reconnect}, @reconnect_timeout, nil}}
         end
     end
   end
 
-
   def handle_event(:internal, :connect, :disconnected, %{node_id: node_id} = state) do
-    case TcpConnection.is_connected(node_id) do
+    case @tcp_module.is_connected(node_id) do
       true ->
         updated_state = %{state | state: :connected}
         publish_statechange(updated_state, state.pubsub_topic)
         {:next_state, :connected, updated_state, {:next_event, :internal, :handshake}}
 
       false ->
-        {:keep_state, state, {{:timeout, :reconnect}, 5000, nil}}
+        {:keep_state, state, {{:timeout, :reconnect}, @reconnect_timeout, nil}}
     end
   end
 
@@ -229,15 +235,16 @@ defmodule SEC_Node_Statem do
             Logger.info("Descriptive data constant --> connected & initialized")
             updated_state = %{state | state: :initialized}
             publish_statechange(updated_state, state.pubsub_topic)
-            {:next_state, :initialized, updated_state, [
-              {:next_event, :internal, :activate},
-              {{:timeout, :inactivity_check}, @inactivity_timeout, nil}
-            ]}
+
+            {:next_state, :initialized, updated_state,
+             [
+               {:next_event, :internal, :activate},
+               {{:timeout, :inactivity_check}, @inactivity_timeout, nil}
+             ]}
 
           # Description changed update uuid, equipment_id and description
           _ ->
             Logger.info("Descriptive data changed issuing new uuid --> connected & initialized")
-
 
             updated_state_descr = %{
               state
@@ -251,10 +258,12 @@ defmodule SEC_Node_Statem do
             updated_state_descr = %{updated_state_descr | state: :initialized}
             publish_descriptive_data_change(updated_state_descr, state.pubsub_topic)
             publish_statechange(updated_state_descr, state.pubsub_topic)
-            {:next_state, :initialized, updated_state_descr, [
-              {:next_event, :internal, :activate},
-              {{:timeout, :inactivity_check}, @inactivity_timeout, nil}
-            ]}
+
+            {:next_state, :initialized, updated_state_descr,
+             [
+               {:next_event, :internal, :activate},
+               {{:timeout, :inactivity_check}, @inactivity_timeout, nil}
+             ]}
         end
 
       {:error, _} ->
@@ -356,7 +365,7 @@ defmodule SEC_Node_Statem do
 
   def handle_event({:call, from}, :deactivate, :initialized, %{node_id: node_id} = state) do
     Logger.info("Deactivate Message sent")
-    TcpConnection.send_message(node_id, ~c"deactivate\n")
+    @tcp_module.send_message(node_id, ~c"deactivate\n")
 
     receive do
       {:inactive} ->
@@ -371,7 +380,7 @@ defmodule SEC_Node_Statem do
         {:keep_state_and_data,
          {:reply, from, {:error, :deactivate, specifier, error_class, error_text, error_dict}}}
     after
-      5000 -> {:keep_state_and_data, {:reply, from, {:error, :timeout}}}
+      @call_timeout -> {:keep_state_and_data, {:reply, from, {:error, :timeout}}}
     end
   end
 
@@ -385,7 +394,7 @@ defmodule SEC_Node_Statem do
 
     Logger.info("Change Message '#{String.trim_trailing(message)}' sent")
 
-    TcpConnection.send_message(node_id, String.to_charlist(message))
+    @tcp_module.send_message(node_id, String.to_charlist(message))
 
     receive do
       {:changed, r_module, r_parameter, data_report} ->
@@ -398,7 +407,7 @@ defmodule SEC_Node_Statem do
         {:keep_state_and_data,
          {:reply, from, {:error, :change, specifier, error_class, error_text, error_dict}}}
     after
-      5000 -> {:keep_state_and_data, {:reply, from, {:error, :timeout}}}
+      @call_timeout -> {:keep_state_and_data, {:reply, from, {:error, :timeout}}}
     end
   end
 
@@ -411,7 +420,7 @@ defmodule SEC_Node_Statem do
     message = "do #{module}:#{command} #{value}\n"
 
     Logger.info("Do Message '#{String.trim_trailing(message)}' sent")
-    TcpConnection.send_message(node_id, String.to_charlist(message))
+    @tcp_module.send_message(node_id, String.to_charlist(message))
 
     receive do
       {:done, r_module, r_command, data_report} ->
@@ -427,7 +436,7 @@ defmodule SEC_Node_Statem do
         {:keep_state_and_data,
          {:reply, from, {:error, :do, specifier, error_class, error_text, error_dict}}}
     after
-      5000 -> {:keep_state_and_data, {:reply, from, {:error, :timeout}}}
+      @call_timeout -> {:keep_state_and_data, {:reply, from, {:error, :timeout}}}
     end
   end
 
@@ -440,7 +449,7 @@ defmodule SEC_Node_Statem do
     message = "read #{module}:#{parameter}\n"
 
     Logger.info("Read Message '#{String.trim_trailing(message)}' sent")
-    TcpConnection.send_message(node_id, String.to_charlist(message))
+    @tcp_module.send_message(node_id, String.to_charlist(message))
 
     receive do
       {:reply, r_module, r_parameter, data_report} ->
@@ -456,7 +465,7 @@ defmodule SEC_Node_Statem do
         {:keep_state_and_data,
          {:reply, from, {:error, :read, specifier, error_class, error_text, error_dict}}}
     after
-      5000 -> {:keep_state_and_data, {:reply, from, {:error, :timeout}}}
+      @call_timeout -> {:keep_state_and_data, {:reply, from, {:error, :timeout}}}
     end
   end
 
@@ -467,7 +476,7 @@ defmodule SEC_Node_Statem do
     message = "ping #{id}\n"
 
     Logger.info("Ping Message '#{String.trim_trailing(message)}' sent")
-    TcpConnection.send_message(node_id, String.to_charlist(message))
+    @tcp_module.send_message(node_id, String.to_charlist(message))
 
     receive do
       {:pong, id, data} ->
@@ -480,11 +489,16 @@ defmodule SEC_Node_Statem do
         {:keep_state_and_data,
          {:reply, from, {:error, :ping, specifier, error_class, error_text, error_dict}}}
     after
-      5000 -> {:keep_state_and_data, {:reply, from, {:error, :timeout}}}
+      @call_timeout -> {:keep_state_and_data, {:reply, from, {:error, :timeout}}}
     end
   end
 
-  def handle_event({:timeout, :inactivity_check}, nil, :initialized, %{node_id: node_id, last_seen_update_ts: last_seen} = state) do
+  def handle_event(
+        {:timeout, :inactivity_check},
+        nil,
+        :initialized,
+        %{node_id: node_id, last_seen_update_ts: last_seen} = state
+      ) do
     current_ts =
       case NodeTable.lookup(node_id, :last_update_timestamp) do
         {:ok, ts} -> ts
@@ -495,7 +509,7 @@ defmodule SEC_Node_Statem do
       id = Integer.to_string(:rand.uniform(100_000))
       message = "ping #{id}\n"
       Logger.debug("Inactivity check: sending ping #{id} to #{inspect(node_id)}")
-      TcpConnection.send_message(node_id, String.to_charlist(message))
+      @tcp_module.send_message(node_id, String.to_charlist(message))
 
       receive do
         {:pong, ^id, _data} ->
@@ -506,11 +520,13 @@ defmodule SEC_Node_Statem do
           Logger.warning("Inactivity check ping error for #{inspect(node_id)}: #{error_text}")
           {:keep_state_and_data, {{:timeout, :inactivity_check}, @inactivity_timeout, nil}}
       after
-        5_000 ->
-          Logger.warning("Inactivity check timed out for #{inspect(node_id)}, triggering reconnect")
-          updated_state = %{state | state: :disconnected}
-          publish_statechange(updated_state, state.pubsub_topic)
-          {:next_state, :disconnected, updated_state, {:next_event, :internal, :connect}}
+        @call_timeout ->
+          Logger.warning(
+            "Inactivity check timed out for #{inspect(node_id)}, checking for queued socket events"
+          )
+
+          maybe_force_disconnect(node_id)
+          {:keep_state_and_data, {{:timeout, :inactivity_check}, @inactivity_timeout, nil}}
       end
     else
       {:keep_state, %{state | last_seen_update_ts: current_ts},
@@ -536,7 +552,7 @@ defmodule SEC_Node_Statem do
 
   def handle_event(:info, {:pong, id, data}, :initialized, _state) do
     Logger.warning("received async PONG message id:#{id}, data:#{data}")
-    {:keep_state_and_data}
+    :keep_state_and_data
   end
 
   def handle_event(
@@ -551,7 +567,7 @@ defmodule SEC_Node_Statem do
       # Notihng changed, probably just a network disconnect
       %{changed: :equal, value: _} ->
         Logger.warning("received async Description: data constant")
-        {:keep_state_and_data}
+        :keep_state_and_data
 
       # Description changed update uuid, equipment_id and description
       _ ->
@@ -570,21 +586,33 @@ defmodule SEC_Node_Statem do
 
   def handle_event(:info, {:done, module, command, data_report}, :initialized, _state) do
     Logger.warning("received async DONE message #{module}:#{command} data: #{data_report}")
-    {:keep_state_and_data}
+    :keep_state_and_data
   end
 
   def handle_event(:info, {:reply, module, parameter, data_report}, :initialized, _state) do
     Logger.warning("received async REPLY message #{module}:#{parameter} data: #{data_report}")
-    {:keep_state_and_data}
+    :keep_state_and_data
   end
 
   def handle_event(:info, {:changed, module, parameter, data_report}, :initialized, _state) do
     Logger.warning("received async CHANGED message #{module}:#{parameter} data: #{data_report}")
-    {:keep_state_and_data}
+    :keep_state_and_data
+  end
+
+  defp maybe_force_disconnect(node_id) do
+    {:messages, msgs} = :erlang.process_info(self(), :messages)
+
+    if :socket_disconnected not in msgs do
+      Logger.warning(
+        "No socket event after inactivity timeout for #{inspect(node_id)}, forcing TCP disconnect"
+      )
+
+      @tcp_module.disconnect(node_id)
+    end
   end
 
   defp send_describe_message(node_id) do
-    TcpConnection.send_message(node_id, ~c"describe .\n")
+    @tcp_module.send_message(node_id, ~c"describe .\n")
 
     receive do
       {:describe, specifier, parsed_description, raw_description} ->
@@ -595,12 +623,12 @@ defmodule SEC_Node_Statem do
         Logger.error("Error on describe request: #{error_text}")
         {:error, {specifier, error_class, error_text, error_dict}}
     after
-      15_000 -> {:error, :timeout}
+      @handshake_timeout -> {:error, :timeout}
     end
   end
 
   defp send_activate_message(node_id) do
-    TcpConnection.send_message(node_id, ~c"activate\n")
+    @tcp_module.send_message(node_id, ~c"activate\n")
 
     receive do
       {:active} ->
@@ -611,7 +639,7 @@ defmodule SEC_Node_Statem do
         Logger.error("Error on activate request: #{error_text}")
         {:error, {specifier, error_class, error_text, error_dict}}
     after
-      15_000 -> {:error, :timeout}
+      @handshake_timeout -> {:error, :timeout}
     end
   end
 
@@ -662,14 +690,17 @@ defmodule SEC_Node_Services do
 
   def start_link(opts) do
     node_id = {opts[:host], opts[:port]}
+
     Supervisor.start_link(__MODULE__, opts,
-      name: {:via, Registry, {Registry.SEC_Node_Services, node_id}})
+      name: {:via, Registry, {Registry.SEC_Node_Services, node_id}}
+    )
   end
 
   def stop(node_id) do
     case Registry.lookup(Registry.SEC_Node_Services, node_id) do
       [{supervisor_pid, _}] ->
         Supervisor.stop(supervisor_pid, :normal)
+
       [] ->
         {:error, :not_found}
     end
@@ -722,7 +753,10 @@ defmodule SEC_Node_Supervisor do
   end
 
   def start_child(opts) do
-    DynamicSupervisor.start_child(__MODULE__, {SEC_Node_Services, Map.put(opts, :restart, :transient)})
+    DynamicSupervisor.start_child(
+      __MODULE__,
+      {SEC_Node_Services, Map.put(opts, :restart, :transient)}
+    )
   end
 
   def get_active_nodes() do
@@ -778,7 +812,13 @@ defmodule NodeTable do
   def start(node_id) do
     case :ets.lookup(@lookup_table, node_id) do
       [{_, table}] ->
-        {:ok, table}
+        if :ets.info(table) != :undefined do
+          {:ok, table}
+        else
+          # Owner process crashed and ETS deleted the table; remove stale entry and recreate.
+          :ets.delete(@lookup_table, node_id)
+          start(node_id)
+        end
 
       [] ->
         table = :ets.new(:ets_table, [:set, :public])
@@ -794,9 +834,6 @@ defmodule NodeTable do
     end
   end
 
-
-
-
   def insert(node_id, key, value) do
     {:ok, table} = get_table(node_id)
 
@@ -806,7 +843,6 @@ defmodule NodeTable do
   end
 
   def lookup(node_id, key) do
-
     try do
       {:ok, table} = get_table(node_id)
 
@@ -821,7 +857,9 @@ defmodule NodeTable do
 
   defp get_table(node_id) do
     case :ets.lookup(@lookup_table, node_id) do
-      [{_, table}] -> {:ok, table}
+      [{_, table}] ->
+        {:ok, table}
+
       [] ->
         Logger.error("Lookup for node_id #{inspect(node_id)} failed - no table found")
         {:error, :notfound}

@@ -63,7 +63,6 @@ defmodule SECoP_Parser do
         data_report
       )
 
-
     Phoenix.PubSub.broadcast(
       :secop_client_pubsub,
       "value_update:#{elem(node_id, 0)}:#{elem(node_id, 1)}",
@@ -159,7 +158,6 @@ defmodule SECoP_Parser do
 
     {:ok, module, command} = splitSpecifier(specifier)
 
-
     Registry.dispatch(Registry.SEC_Node_Statem, node_id, fn entries ->
       for {pid, _value} <- entries do
         send(pid, {:done, module, command, data_report})
@@ -222,12 +220,13 @@ defmodule SECoP_Parser do
       commands: commands
     }
 
-
     parsed_module_description
   end
 
   def error_update(node_id, specifier, error_report) do
-    Logger.warning("Error update message received. Specifier: #{specifier}, Data: #{inspect(error_report)}")
+    Logger.warning(
+      "Error update message received. Specifier: #{specifier}, Data: #{inspect(error_report)}"
+    )
 
     {:ok, module, accessible} = splitSpecifier(specifier)
 
@@ -237,10 +236,6 @@ defmodule SECoP_Parser do
         {:data_report, String.to_existing_atom(module), String.to_existing_atom(accessible)},
         {:error_report, error_report}
       )
-
-
-
-
 
     Phoenix.PubSub.broadcast(
       :secop_client_pubsub,

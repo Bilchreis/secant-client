@@ -3,12 +3,10 @@ defmodule Mix.Tasks.Client do
   alias SecopClient
   alias SEC_Node_Supervisor
 
-
   @shortdoc "Starts the SecopClient application and runs indefinitely"
 
   def run(_args) do
     Mix.Task.run("app.start")
-
 
     # opts = %{
     #   host: "192.168.178.75" |> String.to_charlist(),
@@ -21,23 +19,16 @@ defmodule Mix.Tasks.Client do
 
     # Process.sleep(3000)
 
-
     # node_map = SEC_Node_Supervisor.get_active_nodes()
 
+    # all_entries = Registry.select(Registry.PlotPublisher,[{{:"$1", :"$2", :"$3"}, [], [{{:"$1", :"$2", :"$3"}}]}])
+    # IO.inspect(all_entries, label: "All entries (key, PID pairs)")
 
+    # Registry.PlotPublisher
 
+    # parameter_id = {~c"192.168.178.52", 10800,:massflow_contr1,:value}
 
-
-    #all_entries = Registry.select(Registry.PlotPublisher,[{{:"$1", :"$2", :"$3"}, [], [{{:"$1", :"$2", :"$3"}}]}])
-    #IO.inspect(all_entries, label: "All entries (key, PID pairs)")
-
-    #Registry.PlotPublisher
-
-    #parameter_id = {~c"192.168.178.52", 10800,:massflow_contr1,:value}
-
-    #IO.inspect(PlotPublisher.get_data(parameter_id))
-
-
+    # IO.inspect(PlotPublisher.get_data(parameter_id))
 
     # Keep the application running indefinitely
     :timer.sleep(:infinity)
