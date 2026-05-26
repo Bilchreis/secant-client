@@ -5,6 +5,7 @@ defmodule TcpConnection do
   require Logger
 
   @behaviour :gen_statem
+  @behaviour TcpConnectionBehaviour
 
   @initial_state :disconnected
 
@@ -76,8 +77,6 @@ defmodule TcpConnection do
   def handle_event(:info, {:tcp, _socket, data}, :connected, %{host: host, port: port} = state) do
     [{buffer_pid, _value}] = Registry.lookup(Registry.Buffer, {host, port})
     Buffer.receive(buffer_pid, data)
-
-    # Update the buffer with remaining data
     {:keep_state, state}
   end
 
@@ -135,6 +134,21 @@ defmodule TcpConnection do
     {:keep_state, state}
   end
 
+  def handle_event({:call, from}, :disconnect, :connected, %{host: host, port: port} = state) do
+    :gen_tcp.close(state.socket)
+
+    Registry.dispatch(Registry.SEC_Node_Statem, {host, port}, fn entries ->
+      for {pid, _} <- entries, do: send(pid, :socket_disconnected)
+    end)
+
+    :gen_statem.reply(from, :ok)
+    {:next_state, :disconnected, %{state | socket: nil}, {:next_event, :internal, :connect}}
+  end
+
+  def handle_event({:call, from}, :disconnect, :disconnected, state) do
+    {:keep_state, state, {:reply, from, :ok}}
+  end
+
   def handle_event({:call, from}, :stop, _state, %{host: host, port: port} = state) do
     # Close socket if connected
     if state.socket, do: :gen_tcp.close(state.socket)
@@ -149,26 +163,34 @@ defmodule TcpConnection do
   end
 
   ## Helpers
+  @impl TcpConnectionBehaviour
   def is_connected(node_id) do
     [{conn_pid, _value}] = Registry.lookup(Registry.TcpConnection, node_id)
     :gen_statem.call(conn_pid, :is_connected)
   end
 
+  @impl TcpConnectionBehaviour
   def send_message(node_id, data) do
     [{conn_pid, _value}] = Registry.lookup(Registry.TcpConnection, node_id)
     :gen_statem.call(conn_pid, {:send, data})
+  end
+
+  @impl TcpConnectionBehaviour
+  def disconnect(node_id) do
+    [{conn_pid, _value}] = Registry.lookup(Registry.TcpConnection, node_id)
+    :gen_statem.call(conn_pid, :disconnect)
   end
 
   def stop(node_id) do
     case Registry.lookup(Registry.TcpConnection, node_id) do
       [{conn_pid, _}] ->
         :gen_statem.call(conn_pid, :stop)
+
       [] ->
         {:error, :not_found}
     end
   end
 end
-
 
 defmodule Buffer do
   @moduledoc "Buffer the data received to parse out statements"
@@ -231,7 +253,4 @@ defmodule Buffer do
       [rest] -> {:nothing, rest}
     end
   end
-
-
-
 end
