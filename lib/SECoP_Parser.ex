@@ -8,53 +8,35 @@ defmodule SECoP_Parser do
     trimmed = String.trim(message)
 
 
-
-    if String.starts_with?(trimmed, "ISSE,SECoP,") do
-      idn(node_id, trimmed)
-    else
-      parse_secop(node_id, trimmed)
-    end
-  end
-
-  defp parse_secop(node_id, trimmed) do
+    # SECoP message are of the form
+    # messge_code specifier data
     split_message = String.split(trimmed, " ", parts: 3)
 
-    # Handle Error Reports:
-    if length(split_message) == 3 and String.starts_with?(hd(split_message), "error_") do
-      [error_message, specifier, data] = split_message
+    case split_message do
+      ["update", specifier, data] -> update(node_id, specifier, data)
+      ["describing", specifier, data] -> describe(node_id, specifier, data)
+      ["inactive"] -> inactive(node_id)
+      ["pong", id, data] -> pong(node_id, id, data)
+      ["active"] -> active(node_id)
+      ["reply", specifier, data] -> reply(node_id, specifier, data)
+      ["changed", specifier, data] -> changed(node_id, specifier, data)
+      ["done", specifier, data] -> done(node_id, specifier, data)
+      ["error_update",specifier,data] -> error_update(node_id, specifier, data)
+      ["error_describe",specifier,data] -> error_response(:error_describe, node_id, specifier, data)
+      ["error_deactivate",specifier,data] -> error_response(:error_deactivate, node_id, specifier, data)
+      ["error_ping",specifier,data] -> error_response(:error_ping, node_id, specifier, data)
+      ["error_activate",specifier,data] -> error_response(:error_activate, node_id, specifier, data)
+      ["error_read",specifier,data] -> error_response(:error_read, node_id, specifier, data)
+      ["error_change",specifier,data] -> error_response(:error_change, node_id, specifier, data)
+      ["error_do",specifier,data] -> error_response(:error_do, node_id, specifier, data)
+      ["ISSE,SECoP," <> _ = idn] -> idn(node_id, idn)
+      _ -> Logger.warning("Unknown message received: #{trimmed}")
 
-      Logger.error(
-        "Error message received: #{error_message}, specifier: #{specifier}, data: #{data}"
-      )
-
-      {:ok, data} = Jason.decode(data, keys: :atoms)
-
-      case error_message do
-        "error_update" -> error_update(node_id, specifier, data)
-        "error_describe" -> error_response(:error_describe, node_id, specifier, data)
-        "error_deactivate" -> error_response(:error_deactivate, node_id, specifier, data)
-        "error_ping" -> error_response(:error_ping, node_id, specifier, data)
-        "error_activate" -> error_response(:error_activate, node_id, specifier, data)
-        "error_read" -> error_response(:error_read, node_id, specifier, data)
-        "error_change" -> error_response(:error_change, node_id, specifier, data)
-        "error_do" -> error_response(:error_do, node_id, specifier, data)
-        _ -> Logger.warning("Unknown error message received: #{trimmed}")
-      end
-    else
-      # Handle all Normal SECoP Messages:
-      case split_message do
-        ["update", specifier, data] -> update(node_id, specifier, data)
-        ["describing", specifier, data] -> describe(node_id, specifier, data)
-        ["inactive"] -> inactive(node_id)
-        ["pong", id, data] -> pong(node_id, id, data)
-        ["active"] -> active(node_id)
-        ["reply", specifier, data] -> reply(node_id, specifier, data)
-        ["changed", specifier, data] -> changed(node_id, specifier, data)
-        ["done", specifier, data] -> done(node_id, specifier, data)
-        _ -> Logger.warning("Unknown message received: #{trimmed}")
-      end
     end
+
+
   end
+
 
   defp idn(node_id, idn_string) do
     Logger.debug("IDN response received: #{idn_string}")
@@ -251,7 +233,9 @@ defmodule SECoP_Parser do
     parsed_module_description
   end
 
-  def error_update(node_id, specifier, error_report) do
+  def error_update(node_id, specifier, data) do
+    {:ok, error_report} = Jason.decode(data, keys: :atoms)
+
     Logger.warning(
       "Error update message received. Specifier: #{specifier}, Data: #{inspect(error_report)}"
     )
@@ -272,7 +256,8 @@ defmodule SECoP_Parser do
     )
   end
 
-  def error_response(error_code, node_id, specifier, error_report) do
+  def error_response(error_code, node_id, specifier, data) do
+    {:ok, error_report} = Jason.decode(data, keys: :atoms)
     error_class = Enum.at(error_report, 0)
     error_text = Enum.at(error_report, 1)
     error_dict = Enum.at(error_report, 2)
