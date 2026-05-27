@@ -1,6 +1,6 @@
 import Config
 
-config :secop_client,
+config :secant_client,
   tcp_connection_module: MockTcpConnection,
   inactivity_timeout: 100,
   reconnect_timeout: 50,
