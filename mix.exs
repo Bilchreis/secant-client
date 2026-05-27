@@ -1,9 +1,9 @@
-defmodule SecopClient.MixProject do
+defmodule SecantClient.MixProject do
   use Mix.Project
 
   def project do
     [
-      app: :secop_client,
+      app: :secant_client,
       version: "0.1.0",
       elixir: "~> 1.17",
       start_permanent: Mix.env() == :prod,
@@ -18,7 +18,7 @@ defmodule SecopClient.MixProject do
   # Run "mix help compile.app" to learn about applications.
   def application do
     [
-      mod: {SecopClient, []},
+      mod: {SecantClient, []},
       extra_applications: [:logger]
     ]
   end

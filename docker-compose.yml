@@ -1,6 +1,6 @@
 services:
 
-  secop_client:
+  secant_client:
     build: .
     restart: always
     network_mode: host

@@ -1,9 +1,9 @@
 defmodule Mix.Tasks.Client do
   use Mix.Task
-  alias SecopClient
+  alias SecantClient
   alias SEC_Node_Supervisor
 
-  @shortdoc "Starts the SecopClient application and runs indefinitely"
+  @shortdoc "Starts the SecantClient application and runs indefinitely"
 
   def run(_args) do
     Mix.Task.run("app.start")

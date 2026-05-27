@@ -7,11 +7,11 @@ defmodule SEC_Node_Statem do
   @behaviour :gen_statem
 
   @initial_state :connecting
-  @tcp_module Application.compile_env(:secop_client, :tcp_connection_module, TcpConnection)
-  @inactivity_timeout Application.compile_env(:secop_client, :inactivity_timeout, 15_000)
-  @reconnect_timeout Application.compile_env(:secop_client, :reconnect_timeout, 5_000)
-  @call_timeout Application.compile_env(:secop_client, :call_timeout, 5_000)
-  @handshake_timeout Application.compile_env(:secop_client, :handshake_timeout, 15_000)
+  @tcp_module Application.compile_env(:secant_client, :tcp_connection_module, TcpConnection)
+  @inactivity_timeout Application.compile_env(:secant_client, :inactivity_timeout, 15_000)
+  @reconnect_timeout Application.compile_env(:secant_client, :reconnect_timeout, 5_000)
+  @call_timeout Application.compile_env(:secant_client, :call_timeout, 5_000)
+  @handshake_timeout Application.compile_env(:secant_client, :handshake_timeout, 15_000)
 
   # Public
   def start_link(opts) do
@@ -673,7 +673,7 @@ defmodule SEC_Node_Statem do
     Logger.debug("publish descriptive data change for #{pubsub_topic}")
 
     Phoenix.PubSub.broadcast(
-      :secop_client_pubsub,
+      :secant_client_pubsub,
       "descriptive_data_change",
       {:description_change, pubsub_topic, state}
     )
@@ -683,7 +683,7 @@ defmodule SEC_Node_Statem do
     Logger.debug("publish conn state change for #{pubsub_topic} connection is active: #{active}")
 
     Phoenix.PubSub.broadcast(
-      :secop_client_pubsub,
+      :secant_client_pubsub,
       "secop_conn_state",
       {:conn_state, pubsub_topic, active}
     )
@@ -693,7 +693,7 @@ defmodule SEC_Node_Statem do
     Logger.debug("publish statechange for #{pubsub_topic} --> #{state.state}")
 
     Phoenix.PubSub.broadcast(
-      :secop_client_pubsub,
+      :secant_client_pubsub,
       "state_change",
       {:state_change, pubsub_topic, state}
     )
@@ -703,7 +703,7 @@ defmodule SEC_Node_Statem do
     Logger.debug("publish new node added at: #{pubsub_topic}")
 
     Phoenix.PubSub.broadcast(
-      :secop_client_pubsub,
+      :secant_client_pubsub,
       "new_node",
       {:new_node, pubsub_topic, state}
     )

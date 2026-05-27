@@ -74,7 +74,7 @@ defmodule SECoP_Parser do
       )
 
     Phoenix.PubSub.broadcast(
-      :secop_client_pubsub,
+      :secant_client_pubsub,
       "value_update:#{elem(node_id, 0)}:#{elem(node_id, 1)}",
       {:value_update, module, accessible, data_report}
     )
@@ -250,7 +250,7 @@ defmodule SECoP_Parser do
       )
 
     Phoenix.PubSub.broadcast(
-      :secop_client_pubsub,
+      :secant_client_pubsub,
       "error_update:#{elem(node_id, 0)}:#{elem(node_id, 1)}",
       {:error_update, module, accessible, error_report}
     )
