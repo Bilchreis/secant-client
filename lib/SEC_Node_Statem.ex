@@ -97,7 +97,8 @@ defmodule SEC_Node_Statem do
       error: false,
       state: :disconnected,
       manual: opts[:manual] || false,
-      last_seen_update_ts: nil
+      last_seen_update_ts: nil,
+      idn: nil
     }
 
     Logger.info("Starting SEC Node State Machine for: #{opts[:host]}:#{opts[:port]}")
@@ -221,59 +222,74 @@ defmodule SEC_Node_Statem do
         :connected,
         %{node_id: node_id, description: description} = state
       ) do
-    # TODO IDN
+    case send_idn_message(node_id) do
+      {:ok, idn} ->
+        Logger.info("IDN handshake successful: #{idn.version}")
+        state = %{state | idn: idn}
 
-    Logger.info("Initial Describe Message sent")
+        Logger.info("Initial Describe Message sent")
 
-    case send_describe_message(node_id) do
-      {:ok, _specifier, parsed_description, raw_description} ->
-        equipment_id = parsed_description[:properties][:equipment_id]
+        case send_describe_message(node_id) do
+          {:ok, _specifier, parsed_description, raw_description} ->
+            equipment_id = parsed_description[:properties][:equipment_id]
 
-        case MapDiff.diff(parsed_description, description) do
-          # Notihng changed, probably just a prior network disconnect
-          %{changed: :equal, value: _} ->
-            Logger.info("Descriptive data constant --> connected & initialized")
-            updated_state = %{state | state: :initialized}
+            case MapDiff.diff(parsed_description, description) do
+              # Nothing changed, probably just a prior network disconnect
+              %{changed: :equal, value: _} ->
+                Logger.info("Descriptive data constant --> connected & initialized")
+                updated_state = %{state | state: :initialized}
+                publish_statechange(updated_state, state.pubsub_topic)
+
+                {:next_state, :initialized, updated_state,
+                 [
+                   {:next_event, :internal, :activate},
+                   {{:timeout, :inactivity_check}, @inactivity_timeout, nil}
+                 ]}
+
+              # Description changed update uuid, equipment_id and description
+              _ ->
+                Logger.info(
+                  "Descriptive data changed issuing new uuid --> connected & initialized"
+                )
+
+                updated_state_descr = %{
+                  state
+                  | description: parsed_description,
+                    raw_description: raw_description,
+                    uuid: Ecto.UUID.generate(),
+                    equipment_id: equipment_id,
+                    state: :initialized
+                }
+
+                updated_state_descr = %{updated_state_descr | state: :initialized}
+                publish_descriptive_data_change(updated_state_descr, state.pubsub_topic)
+                publish_statechange(updated_state_descr, state.pubsub_topic)
+
+                {:next_state, :initialized, updated_state_descr,
+                 [
+                   {:next_event, :internal, :activate},
+                   {{:timeout, :inactivity_check}, @inactivity_timeout, nil}
+                 ]}
+            end
+
+          {:error, _} ->
+            Logger.warning(
+              "NO answer on describe message for #{elem(node_id, 0)}:#{elem(node_id, 1)}, going into ERROR state"
+            )
+
+            updated_state = %{state | state: :could_not_initialize}
             publish_statechange(updated_state, state.pubsub_topic)
-
-            {:next_state, :initialized, updated_state,
-             [
-               {:next_event, :internal, :activate},
-               {{:timeout, :inactivity_check}, @inactivity_timeout, nil}
-             ]}
-
-          # Description changed update uuid, equipment_id and description
-          _ ->
-            Logger.info("Descriptive data changed issuing new uuid --> connected & initialized")
-
-            updated_state_descr = %{
-              state
-              | description: parsed_description,
-                raw_description: raw_description,
-                uuid: Ecto.UUID.generate(),
-                equipment_id: equipment_id,
-                state: :initialized
-            }
-
-            updated_state_descr = %{updated_state_descr | state: :initialized}
-            publish_descriptive_data_change(updated_state_descr, state.pubsub_topic)
-            publish_statechange(updated_state_descr, state.pubsub_topic)
-
-            {:next_state, :initialized, updated_state_descr,
-             [
-               {:next_event, :internal, :activate},
-               {{:timeout, :inactivity_check}, @inactivity_timeout, nil}
-             ]}
+            {:next_state, :could_not_initialize, updated_state}
         end
 
-      {:error, _} ->
+      {:error, :timeout} ->
         Logger.warning(
-          "NO answer on describe message for #{elem(node_id, 0)}:#{elem(node_id, 1)}, going into ERROR state"
+          "IDN timed out for #{elem(node_id, 0)}:#{elem(node_id, 1)}, going into ERROR state"
         )
 
         updated_state = %{state | state: :could_not_initialize}
         publish_statechange(updated_state, state.pubsub_topic)
-        {:next_state, :could_not_initialize, state}
+        {:next_state, :could_not_initialize, updated_state}
     end
   end
 
@@ -290,7 +306,7 @@ defmodule SEC_Node_Statem do
   end
 
   def handle_event({:call, from}, :get_state, state_name, state)
-      when state_name in [:initialized, :connected, :disconnected, :connecting] do
+      when state_name in [:initialized, :connected, :disconnected, :connecting, :could_not_initialize] do
     {:keep_state_and_data, {:reply, from, {:ok, state}}}
   end
 
@@ -608,6 +624,16 @@ defmodule SEC_Node_Statem do
       )
 
       @tcp_module.disconnect(node_id)
+    end
+  end
+
+  defp send_idn_message(node_id) do
+    @tcp_module.send_message(node_id, ~c"*IDN?\n")
+
+    receive do
+      {:identification, %SECoP_IDN{} = idn} -> {:ok, idn}
+    after
+      @handshake_timeout -> {:error, :timeout}
     end
   end
 

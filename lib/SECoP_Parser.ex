@@ -5,7 +5,19 @@ defmodule SECoP_Parser do
   alias Jason
 
   def parse(node_id, message) do
-    split_message = String.trim(message) |> String.split(" ", parts: 3)
+    trimmed = String.trim(message)
+
+
+
+    if String.starts_with?(trimmed, "ISSE,SECoP,") do
+      idn(node_id, trimmed)
+    else
+      parse_secop(node_id, trimmed)
+    end
+  end
+
+  defp parse_secop(node_id, trimmed) do
+    split_message = String.split(trimmed, " ", parts: 3)
 
     # Handle Error Reports:
     if length(split_message) == 3 and String.starts_with?(hd(split_message), "error_") do
@@ -26,7 +38,7 @@ defmodule SECoP_Parser do
         "error_read" -> error_response(:error_read, node_id, specifier, data)
         "error_change" -> error_response(:error_change, node_id, specifier, data)
         "error_do" -> error_response(:error_do, node_id, specifier, data)
-        _ -> Logger.warning("Unknown error message received: #{message}")
+        _ -> Logger.warning("Unknown error message received: #{trimmed}")
       end
     else
       # Handle all Normal SECoP Messages:
@@ -39,9 +51,25 @@ defmodule SECoP_Parser do
         ["reply", specifier, data] -> reply(node_id, specifier, data)
         ["changed", specifier, data] -> changed(node_id, specifier, data)
         ["done", specifier, data] -> done(node_id, specifier, data)
-        _ -> Logger.warning("Unknown message received: #{message}")
+        _ -> Logger.warning("Unknown message received: #{trimmed}")
       end
     end
+  end
+
+  defp idn(node_id, idn_string) do
+    Logger.debug("IDN response received: #{idn_string}")
+    [manufacturer, product, draft_date, version] = String.split(idn_string, ",", parts: 4)
+
+    struct = %SECoP_IDN{
+      manufacturer: manufacturer,
+      product: product,
+      draft_date: draft_date,
+      version: version
+    }
+
+    Registry.dispatch(Registry.SEC_Node_Statem, node_id, fn entries ->
+      for {pid, _value} <- entries, do: send(pid, {:identification, struct})
+    end)
   end
 
   defp splitSpecifier(specifier) do

@@ -65,6 +65,14 @@ defmodule SECNodeStatemTest do
   # Called from within the gen_statem process (self() == statem pid).
   defp auto_respond(charlist) do
     case to_string(charlist) do
+      "*IDN?\n" ->
+        send(self(), {:identification, %SECoP_IDN{
+          manufacturer: "ISSE",
+          product: "SECoP",
+          draft_date: "",
+          version: "V2024-09-19"
+        }})
+
       "describe .\n" ->
         send(self(), {:describe, ".", minimal_description(), %{}})
 
@@ -303,6 +311,14 @@ defmodule SECNodeStatemTest do
 
       stub(MockTcpConnection, :send_message, fn _id, charlist ->
         case to_string(charlist) do
+          "*IDN?\n" ->
+            send(self(), {:identification, %SECoP_IDN{
+              manufacturer: "ISSE",
+              product: "SECoP",
+              draft_date: "",
+              version: "V2024-09-19"
+            }})
+
           <<"ping ", rest::binary>> ->
             if :counters.get(describe_count, 1) == 0 do
               # First inactivity ping: simulate drop+reconnect while the
@@ -403,6 +419,44 @@ defmodule SECNodeStatemTest do
       # After reconnect_timeout (50 ms) the timer fires, is_connected returns
       # true, and the handshake completes.
       assert wait_for_state(ctx.node_id, :initialized, 2_000) == :ok
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # IDN handshake
+  # ---------------------------------------------------------------------------
+
+  describe "IDN handshake" do
+    test "sends *IDN? as first handshake message and stores parsed struct in state", ctx do
+      stub(MockTcpConnection, :is_connected, fn _id -> true end)
+      test_pid = self()
+
+      stub(MockTcpConnection, :send_message, fn _id, cl ->
+        if to_string(cl) == "*IDN?\n", do: send(test_pid, :idn_sent)
+        auto_respond(cl)
+        :ok
+      end)
+
+      start_statem(ctx)
+      assert_receive :idn_sent, 1_000
+      :ok = wait_for_state(ctx.node_id, :initialized, 1_000)
+
+      assert get_state_data(ctx.node_id).idn == %SECoP_IDN{
+               manufacturer: "ISSE",
+               product: "SECoP",
+               draft_date: "",
+               version: "V2024-09-19"
+             }
+    end
+
+    test "transitions to :could_not_initialize when IDN times out", ctx do
+      stub(MockTcpConnection, :is_connected, fn _id -> true end)
+      # send_message responds to nothing — IDN will time out
+      stub(MockTcpConnection, :send_message, fn _id, _msg -> :ok end)
+
+      start_statem(ctx)
+      # handshake_timeout in test config is 500 ms
+      assert wait_for_state(ctx.node_id, :could_not_initialize, 2_000) == :ok
     end
   end
 end
