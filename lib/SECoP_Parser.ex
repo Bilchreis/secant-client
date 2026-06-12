@@ -30,6 +30,7 @@ defmodule SECoP_Parser do
       ["error_change",specifier,data] -> error_response(:error_change, node_id, specifier, data)
       ["error_do",specifier,data] -> error_response(:error_do, node_id, specifier, data)
       ["ISSE,SECoP," <> _ = idn] -> idn(node_id, idn)
+      ["ISSE&SINE2020,SECoP," <> _ = idn] -> idn(node_id, idn)
       _ -> Logger.warning("Unknown message received: #{trimmed}")
 
     end
