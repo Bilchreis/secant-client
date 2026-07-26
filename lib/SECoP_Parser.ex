@@ -7,37 +7,69 @@ defmodule SECoP_Parser do
   def parse(node_id, message) do
     trimmed = String.trim(message)
 
-
     # SECoP message are of the form
     # messge_code specifier data
     split_message = String.split(trimmed, " ", parts: 3)
 
     case split_message do
-      ["update", specifier, data] -> update(node_id, specifier, data)
-      ["describing", specifier, data] -> describe(node_id, specifier, data)
-      ["inactive"] -> inactive(node_id)
-      ["pong", id, data] -> pong(node_id, id, data)
-      ["active"] -> active(node_id)
-      ["reply", specifier, data] -> reply(node_id, specifier, data)
-      ["changed", specifier, data] -> changed(node_id, specifier, data)
-      ["done", specifier, data] -> done(node_id, specifier, data)
-      ["error_update",specifier,data] -> error_update(node_id, specifier, data)
-      ["error_describe",specifier,data] -> error_response(:error_describe, node_id, specifier, data)
-      ["error_deactivate",specifier,data] -> error_response(:error_deactivate, node_id, specifier, data)
-      ["error_ping",specifier,data] -> error_response(:error_ping, node_id, specifier, data)
-      ["error_activate",specifier,data] -> error_response(:error_activate, node_id, specifier, data)
-      ["error_read",specifier,data] -> error_response(:error_read, node_id, specifier, data)
-      ["error_change",specifier,data] -> error_response(:error_change, node_id, specifier, data)
-      ["error_do",specifier,data] -> error_response(:error_do, node_id, specifier, data)
-      ["ISSE,SECoP," <> _ = idn] -> idn(node_id, idn)
-      ["ISSE&SINE2020,SECoP," <> _ = idn] -> idn(node_id, idn)
-      _ -> Logger.warning("Unknown message received: #{trimmed}")
+      ["update", specifier, data] ->
+        update(node_id, specifier, data)
 
+      ["describing", specifier, data] ->
+        describe(node_id, specifier, data)
+
+      ["inactive"] ->
+        inactive(node_id)
+
+      ["pong", id, data] ->
+        pong(node_id, id, data)
+
+      ["active"] ->
+        active(node_id)
+
+      ["reply", specifier, data] ->
+        reply(node_id, specifier, data)
+
+      ["changed", specifier, data] ->
+        changed(node_id, specifier, data)
+
+      ["done", specifier, data] ->
+        done(node_id, specifier, data)
+
+      ["error_update", specifier, data] ->
+        error_update(node_id, specifier, data)
+
+      ["error_describe", specifier, data] ->
+        error_response(:error_describe, node_id, specifier, data)
+
+      ["error_deactivate", specifier, data] ->
+        error_response(:error_deactivate, node_id, specifier, data)
+
+      ["error_ping", specifier, data] ->
+        error_response(:error_ping, node_id, specifier, data)
+
+      ["error_activate", specifier, data] ->
+        error_response(:error_activate, node_id, specifier, data)
+
+      ["error_read", specifier, data] ->
+        error_response(:error_read, node_id, specifier, data)
+
+      ["error_change", specifier, data] ->
+        error_response(:error_change, node_id, specifier, data)
+
+      ["error_do", specifier, data] ->
+        error_response(:error_do, node_id, specifier, data)
+
+      ["ISSE,SECoP," <> _ = idn] ->
+        idn(node_id, idn)
+
+      ["ISSE&SINE2020,SECoP," <> _ = idn] ->
+        idn(node_id, idn)
+
+      _ ->
+        Logger.warning("Unknown message received: #{trimmed}")
     end
-
-
   end
-
 
   defp idn(node_id, idn_string) do
     Logger.debug("IDN response received: #{idn_string}")

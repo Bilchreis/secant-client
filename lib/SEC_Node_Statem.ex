@@ -306,7 +306,13 @@ defmodule SEC_Node_Statem do
   end
 
   def handle_event({:call, from}, :get_state, state_name, state)
-      when state_name in [:initialized, :connected, :disconnected, :connecting, :could_not_initialize] do
+      when state_name in [
+             :initialized,
+             :connected,
+             :disconnected,
+             :connecting,
+             :could_not_initialize
+           ] do
     {:keep_state_and_data, {:reply, from, {:ok, state}}}
   end
 
