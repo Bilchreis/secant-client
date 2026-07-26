@@ -66,12 +66,16 @@ defmodule SECNodeStatemTest do
   defp auto_respond(charlist) do
     case to_string(charlist) do
       "*IDN?\n" ->
-        send(self(), {:identification, %SECoP_IDN{
-          manufacturer: "ISSE",
-          product: "SECoP",
-          draft_date: "",
-          version: "V2024-09-19"
-        }})
+        send(
+          self(),
+          {:identification,
+           %SECoP_IDN{
+             manufacturer: "ISSE",
+             product: "SECoP",
+             draft_date: "",
+             version: "V2024-09-19"
+           }}
+        )
 
       "describe .\n" ->
         send(self(), {:describe, ".", minimal_description(), %{}})
@@ -312,12 +316,16 @@ defmodule SECNodeStatemTest do
       stub(MockTcpConnection, :send_message, fn _id, charlist ->
         case to_string(charlist) do
           "*IDN?\n" ->
-            send(self(), {:identification, %SECoP_IDN{
-              manufacturer: "ISSE",
-              product: "SECoP",
-              draft_date: "",
-              version: "V2024-09-19"
-            }})
+            send(
+              self(),
+              {:identification,
+               %SECoP_IDN{
+                 manufacturer: "ISSE",
+                 product: "SECoP",
+                 draft_date: "",
+                 version: "V2024-09-19"
+               }}
+            )
 
           <<"ping ", rest::binary>> ->
             if :counters.get(describe_count, 1) == 0 do
