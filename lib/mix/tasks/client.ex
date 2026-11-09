@@ -1,12 +1,12 @@
 defmodule Mix.Tasks.Client do
   use Mix.Task
-  alias SecantClient
   alias SEC_Node_Supervisor
 
-  @shortdoc "Starts the SecantClient application and runs indefinitely"
+  @shortdoc "Starts SecantClient.Supervisor and runs indefinitely"
 
   def run(_args) do
     Mix.Task.run("app.start")
+    {:ok, _pid} = SecantClient.Supervisor.start_link()
 
     # opts = %{
     #   host: "192.168.178.75" |> String.to_charlist(),
