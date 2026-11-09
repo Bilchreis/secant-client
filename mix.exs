@@ -16,9 +16,11 @@ defmodule SecantClient.MixProject do
   defp elixirc_paths(_), do: ["lib"]
 
   # Run "mix help compile.app" to learn about applications.
+  #
+  # No application callback: secant_client is a library. Host applications
+  # start `SecantClient.Supervisor` in their own supervision tree.
   def application do
     [
-      mod: {SecantClient, []},
       extra_applications: [:logger]
     ]
   end
