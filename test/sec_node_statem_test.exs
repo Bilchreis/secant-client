@@ -627,5 +627,26 @@ defmodule SECNodeStatemTest do
 
       assert NodeTable.insert(ctx.node_id, :probe, 1) == {:ok, :inserted}
     end
+
+    test "a reconnect timer firing in :could_not_initialize does not crash", ctx do
+      stub(MockTcpConnection, :is_connected, fn _id -> true end)
+      start_statem(ctx)
+      :ok = wait_for_state(ctx.node_id, :could_not_initialize, 2_000)
+      pid = statem_pid(ctx.node_id)
+
+      # Disconnect while TCP is down: arms the 50 ms reconnect timer.
+      stub(MockTcpConnection, :is_connected, fn _id -> false end)
+      inject(ctx.node_id, :socket_disconnected)
+      :ok = wait_for_state(ctx.node_id, :disconnected, 500)
+
+      # The socket comes back but the node stays silent: the handshake times
+      # out (500 ms) and the queued timer is delivered in :could_not_initialize.
+      inject(ctx.node_id, :socket_connected)
+      :ok = wait_for_state(ctx.node_id, :could_not_initialize, 2_000)
+      Process.sleep(100)
+
+      assert statem_pid(ctx.node_id) == pid
+      assert get_state_data(ctx.node_id).state == :could_not_initialize
+    end
   end
 end

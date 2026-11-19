@@ -154,13 +154,9 @@ defmodule SEC_Node_Statem do
     {:keep_state, state, {:next_event, :internal, :connect}}
   end
 
-  # Do noting if Connection was already established again
-  def handle_event({:timeout, :reconnect}, nil, :initialized, _state) do
-    {:keep_state_and_data, []}
-  end
-
-  # Do noting if Connection was already established again
-  def handle_event({:timeout, :reconnect}, nil, :connected, _state) do
+  # The timer can outlive :disconnected (the socket came back, or a handshake
+  # ended in :could_not_initialize). Ignore it in every other state.
+  def handle_event({:timeout, :reconnect}, nil, _state_name, _state) do
     {:keep_state_and_data, []}
   end
 
