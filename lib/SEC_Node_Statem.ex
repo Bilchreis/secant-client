@@ -103,6 +103,11 @@ defmodule SEC_Node_Statem do
 
     Logger.info("Starting SEC Node State Machine for: #{opts[:host]}:#{opts[:port]}")
 
+    # After a restart, pick up the identity the previous instance stored, so an
+    # unchanged description keeps its uuid. The table is owned by
+    # NodeTable.Owner and survives a crash of this process.
+    state = restore_identity(state)
+
     # No need to manually start TCP connection - supervisor handles it
     {:ok, @initial_state, state, {:next_event, :internal, :connect}}
   end
@@ -112,7 +117,6 @@ defmodule SEC_Node_Statem do
     case @tcp_module.is_connected(node_id) do
       true ->
         updated_state = %{state | state: :connected}
-        NodeTable.start(state.node_id)
         publish_new_node(state, state.pubsub_topic)
         {:next_state, :connected, updated_state, {:next_event, :internal, :handshake}}
 
@@ -152,13 +156,9 @@ defmodule SEC_Node_Statem do
     {:keep_state, state, {:next_event, :internal, :connect}}
   end
 
-  # Do noting if Connection was already established again
-  def handle_event({:timeout, :reconnect}, nil, :initialized, _state) do
-    {:keep_state_and_data, []}
-  end
-
-  # Do noting if Connection was already established again
-  def handle_event({:timeout, :reconnect}, nil, :connected, _state) do
+  # The timer can outlive :disconnected (the socket came back, or a handshake
+  # ended in :could_not_initialize). Ignore it in every other state.
+  def handle_event({:timeout, :reconnect}, nil, _state_name, _state) do
     {:keep_state_and_data, []}
   end
 
@@ -231,8 +231,6 @@ defmodule SEC_Node_Statem do
 
         case send_describe_message(node_id) do
           {:ok, _specifier, parsed_description, raw_description} ->
-            equipment_id = parsed_description[:properties][:equipment_id]
-
             case MapDiff.diff(parsed_description, description) do
               # Nothing changed, probably just a prior network disconnect
               %{changed: :equal, value: _} ->
@@ -252,17 +250,13 @@ defmodule SEC_Node_Statem do
                   "Descriptive data changed issuing new uuid --> connected & initialized"
                 )
 
-                updated_state_descr = %{
-                  state
-                  | description: parsed_description,
-                    raw_description: raw_description,
-                    uuid: Ecto.UUID.generate(),
-                    equipment_id: equipment_id,
-                    state: :initialized
-                }
+                updated_state_descr =
+                  apply_description_change(
+                    %{state | state: :initialized},
+                    parsed_description,
+                    raw_description
+                  )
 
-                updated_state_descr = %{updated_state_descr | state: :initialized}
-                publish_descriptive_data_change(updated_state_descr, state.pubsub_topic)
                 publish_statechange(updated_state_descr, state.pubsub_topic)
 
                 {:next_state, :initialized, updated_state_descr,
@@ -326,8 +320,6 @@ defmodule SEC_Node_Statem do
 
     case send_describe_message(node_id) do
       {:ok, _specifier, parsed_description, raw_description} ->
-        equipment_id = parsed_description[:properties][:equipment_id]
-
         case MapDiff.diff(parsed_description, description) do
           # Notihng changed, probably just a network disconnect
           %{changed: :equal, value: _} ->
@@ -338,15 +330,9 @@ defmodule SEC_Node_Statem do
           _ ->
             Logger.info("Descriptive data changed issuing new uuid")
 
-            updated_state_descr = %{
-              state
-              | description: parsed_description,
-                raw_description: raw_description,
-                uuid: Ecto.UUID.generate(),
-                equipment_id: equipment_id
-            }
+            updated_state_descr =
+              apply_description_change(state, parsed_description, raw_description)
 
-            publish_descriptive_data_change(updated_state_descr, state.pubsub_topic)
             {:keep_state, updated_state_descr, {:reply, from, {:describing, parsed_description}}}
         end
 
@@ -579,12 +565,10 @@ defmodule SEC_Node_Statem do
 
   def handle_event(
         :info,
-        {:describe, _specifier, parsed_description},
+        {:describe, _specifier, parsed_description, raw_description},
         :initialized,
         %{description: description} = state
       ) do
-    equipment_id = parsed_description[:properties][:equipment_id]
-
     case MapDiff.diff(parsed_description, description) do
       # Notihng changed, probably just a network disconnect
       %{changed: :equal, value: _} ->
@@ -595,30 +579,108 @@ defmodule SEC_Node_Statem do
       _ ->
         Logger.warning("received async Description: data changed issuing new uuid")
 
-        updated_state_descr = %{
-          state
-          | description: parsed_description,
-            uuid: Ecto.UUID.generate(),
-            equipment_id: equipment_id
-        }
+        updated_state_descr =
+          apply_description_change(state, parsed_description, raw_description)
 
         {:keep_state, updated_state_descr}
     end
   end
 
   def handle_event(:info, {:done, module, command, data_report}, :initialized, _state) do
-    Logger.warning("received async DONE message #{module}:#{command} data: #{data_report}")
+    Logger.warning(
+      "received async DONE message #{module}:#{command} data: #{inspect(data_report)}"
+    )
+
     :keep_state_and_data
   end
 
   def handle_event(:info, {:reply, module, parameter, data_report}, :initialized, _state) do
-    Logger.warning("received async REPLY message #{module}:#{parameter} data: #{data_report}")
+    Logger.warning(
+      "received async REPLY message #{module}:#{parameter} data: #{inspect(data_report)}"
+    )
+
     :keep_state_and_data
   end
 
   def handle_event(:info, {:changed, module, parameter, data_report}, :initialized, _state) do
-    Logger.warning("received async CHANGED message #{module}:#{parameter} data: #{data_report}")
+    Logger.warning(
+      "received async CHANGED message #{module}:#{parameter} data: #{inspect(data_report)}"
+    )
+
     :keep_state_and_data
+  end
+
+  # The socket can also drop before the handshake has finished. Retry the
+  # connection instead of staying in :could_not_initialize.
+  def handle_event(:info, :socket_disconnected, :could_not_initialize, state) do
+    updated_state = %{state | state: :disconnected}
+    publish_statechange(updated_state, state.pubsub_topic)
+    {:next_state, :disconnected, updated_state, {:next_event, :internal, :connect}}
+  end
+
+  # A handshake reply that arrives after the handshake timed out, or a fresh
+  # connection, means the node may answer now: run the handshake again.
+  def handle_event(:info, message, :could_not_initialize, state)
+      when message == :socket_connected or
+             (is_tuple(message) and elem(message, 0) in [:identification, :describe]) do
+    Logger.info(
+      "Retrying handshake for #{state.pubsub_topic} after #{inspect(message, limit: 3)}"
+    )
+
+    updated_state = %{state | state: :disconnected}
+    publish_statechange(updated_state, state.pubsub_topic)
+    {:next_state, :disconnected, updated_state, {:next_event, :internal, :connect}}
+  end
+
+  # Already disconnected (or about to check the connection): nothing to do.
+  def handle_event(:info, :socket_disconnected, state_name, _state)
+      when state_name in [:connecting, :disconnected] do
+    :keep_state_and_data
+  end
+
+  # Log and drop any other message instead of crashing the state machine
+  # (and getting a new uuid on restart).
+  def handle_event(:info, message, state_name, _state) do
+    Logger.warning("Unexpected message in state #{state_name}: #{inspect(message, limit: 5)}")
+    :keep_state_and_data
+  end
+
+  # Store a changed description under a new uuid, drop values of modules and
+  # parameters that are no longer described, and announce the change.
+  defp apply_description_change(state, parsed_description, raw_description) do
+    updated_state = %{
+      state
+      | description: parsed_description,
+        raw_description: raw_description,
+        uuid: Ecto.UUID.generate(),
+        equipment_id: parsed_description[:properties][:equipment_id]
+    }
+
+    NodeTable.prune(state.node_id, parsed_description)
+    store_identity(updated_state)
+    publish_descriptive_data_change(updated_state, state.pubsub_topic)
+    updated_state
+  end
+
+  @identity_fields [:uuid, :description, :raw_description, :equipment_id]
+
+  # Stored under its own key: SECoP_Parser overwrites :description before
+  # this process compares it, so that key cannot serve as the previous one.
+  defp store_identity(state) do
+    NodeTable.insert(state.node_id, :statem_identity, Map.take(state, @identity_fields))
+  rescue
+    error -> Logger.warning("Could not store node identity: #{inspect(error)}")
+  end
+
+  defp restore_identity(state) do
+    case NodeTable.lookup(state.node_id, :statem_identity) do
+      {:ok, identity} ->
+        Logger.info("Restored identity #{identity.uuid} for #{state.pubsub_topic}")
+        Map.merge(state, identity)
+
+      {:error, _} ->
+        state
+    end
   end
 
   defp maybe_force_disconnect(node_id) do
@@ -743,6 +805,9 @@ defmodule SEC_Node_Services do
     node_id = {opts[:host], opts[:port]}
 
     children = [
+      # Owns the node's ETS table, so values and identity survive restarts
+      # of the processes below
+      {NodeTable.Owner, node_id},
       # Buffer process for this specific node
       {Buffer, node_id},
       # TCP connection for this specific node
@@ -875,16 +940,34 @@ defmodule NodeTable do
   end
 
   def lookup(node_id, key) do
-    try do
-      {:ok, table} = get_table(node_id)
-
+    with {:ok, table} <- get_table(node_id) do
       case :ets.lookup(table, key) do
         [{_, value}] -> {:ok, value}
         [] -> {:error, :notfound}
       end
-    rescue
-      ArgumentError -> {:error, :table_not_found}
     end
+  rescue
+    ArgumentError -> {:error, :table_not_found}
+  end
+
+  # Delete data reports of modules and parameters that are not in the description.
+  def prune(node_id, description) do
+    modules = description[:modules] || %{}
+
+    with {:ok, table} <- get_table(node_id) do
+      table
+      |> :ets.match({{:data_report, :"$1", :"$2"}, :_})
+      |> Enum.reject(fn [module, parameter] ->
+        Map.has_key?(get_in(modules, [module, :parameters]) || %{}, parameter)
+      end)
+      |> Enum.each(fn [module, parameter] ->
+        :ets.delete(table, {:data_report, module, parameter})
+      end)
+
+      :ok
+    end
+  rescue
+    ArgumentError -> {:error, :table_not_found}
   end
 
   defp get_table(node_id) do
@@ -896,5 +979,26 @@ defmodule NodeTable do
         Logger.error("Lookup for node_id #{inspect(node_id)} failed - no table found")
         {:error, :notfound}
     end
+  end
+end
+
+defmodule NodeTable.Owner do
+  @moduledoc """
+  Owns a node's ETS table. It runs as the first child of SEC_Node_Services,
+  so the table outlives restarts of the TCP connection and the state machine,
+  and is deleted when the node is stopped.
+  """
+  use GenServer
+
+  def start_link(node_id), do: GenServer.start_link(__MODULE__, node_id)
+
+  def child_spec(node_id) do
+    %{id: {__MODULE__, node_id}, start: {__MODULE__, :start_link, [node_id]}}
+  end
+
+  @impl true
+  def init(node_id) do
+    {:ok, _table} = NodeTable.start(node_id)
+    {:ok, node_id}
   end
 end

@@ -467,4 +467,253 @@ defmodule SECNodeStatemTest do
       assert wait_for_state(ctx.node_id, :could_not_initialize, 2_000) == :ok
     end
   end
+
+  # ---------------------------------------------------------------------------
+  # Description changes (issue #13)
+  # ---------------------------------------------------------------------------
+
+  defp statem_pid(node_id) do
+    [{pid, _}] = Registry.lookup(Registry.SEC_Node_Statem, node_id)
+    pid
+  end
+
+  defp description_with(modules) do
+    %{properties: %{equipment_id: "test-device"}, modules: modules}
+  end
+
+  defp module_with(parameters) do
+    %{
+      properties: %{},
+      parameters: Map.new(parameters, &{&1, %{value: nil}}),
+      commands: %{}
+    }
+  end
+
+  describe "description changes" do
+    test "async describe with a new description updates state and broadcasts it", ctx do
+      drive_to_initialized(ctx)
+      pid = statem_pid(ctx.node_id)
+      old = get_state_data(ctx.node_id)
+      Phoenix.PubSub.subscribe(:secant_client_pubsub, "descriptive_data_change")
+
+      new_description = description_with(%{T: module_with([:value])})
+      inject(ctx.node_id, {:describe, ".", new_description, %{raw: true}})
+
+      topic = "#{ctx.host}:#{ctx.port}"
+      assert_receive {:description_change, ^topic, announced}, 1_000
+      assert announced.description == new_description
+      assert announced.raw_description == %{raw: true}
+      assert announced.uuid != old.uuid
+
+      assert statem_pid(ctx.node_id) == pid
+      state = get_state_data(ctx.node_id)
+      assert state.uuid == announced.uuid
+      assert state.description == new_description
+    end
+
+    test "async describe with an unchanged description keeps the uuid", ctx do
+      drive_to_initialized(ctx)
+      pid = statem_pid(ctx.node_id)
+      old = get_state_data(ctx.node_id)
+      Phoenix.PubSub.subscribe(:secant_client_pubsub, "descriptive_data_change")
+
+      inject(ctx.node_id, {:describe, ".", minimal_description(), %{}})
+
+      refute_receive {:description_change, _, _}, 200
+      assert statem_pid(ctx.node_id) == pid
+      assert get_state_data(ctx.node_id).uuid == old.uuid
+    end
+
+    test "a description change drops values of removed modules and parameters", ctx do
+      drive_to_initialized(ctx)
+
+      NodeTable.insert(ctx.node_id, {:data_report, :T, :value}, [1.0, %{}])
+      NodeTable.insert(ctx.node_id, {:data_report, :T, :removed}, [2.0, %{}])
+      NodeTable.insert(ctx.node_id, {:data_report, :Gone, :value}, [3.0, %{}])
+      NodeTable.insert(ctx.node_id, :last_update_timestamp, 123)
+      old_uuid = get_state_data(ctx.node_id).uuid
+
+      inject(ctx.node_id, {:describe, ".", description_with(%{T: module_with([:value])}), %{}})
+      :ok = wait_for_uuid_change(ctx.node_id, old_uuid)
+
+      assert NodeTable.lookup(ctx.node_id, {:data_report, :T, :value}) == {:ok, [1.0, %{}]}
+      assert NodeTable.lookup(ctx.node_id, {:data_report, :T, :removed}) == {:error, :notfound}
+      assert NodeTable.lookup(ctx.node_id, {:data_report, :Gone, :value}) == {:error, :notfound}
+      assert NodeTable.lookup(ctx.node_id, :last_update_timestamp) == {:ok, 123}
+    end
+  end
+
+  defp wait_for_uuid_change(node_id, uuid) do
+    Enum.reduce_while(1..100, {:error, :timeout}, fn _, acc ->
+      if get_state_data(node_id).uuid != uuid do
+        {:halt, :ok}
+      else
+        Process.sleep(10)
+        {:cont, acc}
+      end
+    end)
+  end
+
+  describe "unexpected messages" do
+    test ":socket_disconnected while :disconnected does not crash", ctx do
+      start_statem(ctx)
+      :ok = wait_for_state(ctx.node_id, :disconnected, 500)
+      pid = statem_pid(ctx.node_id)
+
+      inject(ctx.node_id, :socket_disconnected)
+
+      assert get_state_data(ctx.node_id).state == :disconnected
+      assert statem_pid(ctx.node_id) == pid
+    end
+
+    test ":socket_disconnected while :could_not_initialize retries the connection", ctx do
+      stub(MockTcpConnection, :is_connected, fn _id -> true end)
+      start_statem(ctx)
+      :ok = wait_for_state(ctx.node_id, :could_not_initialize, 2_000)
+      pid = statem_pid(ctx.node_id)
+
+      stub(MockTcpConnection, :is_connected, fn _id -> false end)
+      inject(ctx.node_id, :socket_disconnected)
+
+      assert wait_for_state(ctx.node_id, :disconnected, 500) == :ok
+      assert statem_pid(ctx.node_id) == pid
+    end
+
+    test "unknown info messages are dropped without crashing", ctx do
+      drive_to_initialized(ctx)
+      pid = statem_pid(ctx.node_id)
+
+      inject(ctx.node_id, {:something_unexpected, 1})
+
+      assert get_state_data(ctx.node_id).state == :initialized
+      assert statem_pid(ctx.node_id) == pid
+    end
+  end
+
+  describe "review follow-ups" do
+    test "a late handshake reply in :could_not_initialize retries the handshake", ctx do
+      stub(MockTcpConnection, :is_connected, fn _id -> true end)
+      start_statem(ctx)
+      :ok = wait_for_state(ctx.node_id, :could_not_initialize, 2_000)
+      pid = statem_pid(ctx.node_id)
+
+      stub(MockTcpConnection, :send_message, fn _id, cl ->
+        auto_respond(cl)
+        :ok
+      end)
+
+      inject(ctx.node_id, {:describe, ".", minimal_description(), %{}})
+
+      assert wait_for_state(ctx.node_id, :initialized, 1_000) == :ok
+      assert statem_pid(ctx.node_id) == pid
+    end
+
+    test "a late reply with a data report does not crash the statem", ctx do
+      drive_to_initialized(ctx)
+      pid = statem_pid(ctx.node_id)
+
+      inject(ctx.node_id, {:reply, "T", "value", [1.0, %{t: 1.0}]})
+      inject(ctx.node_id, {:changed, "T", "target", [1.0, %{t: 1.0}]})
+      inject(ctx.node_id, {:done, "T", "stop", [nil, %{}]})
+
+      assert get_state_data(ctx.node_id).state == :initialized
+      assert statem_pid(ctx.node_id) == pid
+    end
+
+    test "a reconnect timer firing in :could_not_initialize does not crash", ctx do
+      stub(MockTcpConnection, :is_connected, fn _id -> true end)
+      start_statem(ctx)
+      :ok = wait_for_state(ctx.node_id, :could_not_initialize, 2_000)
+      pid = statem_pid(ctx.node_id)
+
+      # Disconnect while TCP is down: arms the 50 ms reconnect timer.
+      stub(MockTcpConnection, :is_connected, fn _id -> false end)
+      inject(ctx.node_id, :socket_disconnected)
+      :ok = wait_for_state(ctx.node_id, :disconnected, 500)
+
+      # The socket comes back but the node stays silent: the handshake times
+      # out (500 ms) and the queued timer is delivered in :could_not_initialize.
+      inject(ctx.node_id, :socket_connected)
+      :ok = wait_for_state(ctx.node_id, :could_not_initialize, 2_000)
+      Process.sleep(100)
+
+      assert statem_pid(ctx.node_id) == pid
+      assert get_state_data(ctx.node_id).state == :could_not_initialize
+    end
+  end
+
+  describe "identity across restarts" do
+    defp crash_statem(node_id) do
+      pid = statem_pid(node_id)
+      ref = Process.monitor(pid)
+      Process.exit(pid, :kill)
+      assert_receive {:DOWN, ^ref, :process, ^pid, :killed}, 1_000
+      wait_until_unregistered(node_id)
+    end
+
+    defp wait_until_unregistered(node_id) do
+      if Registry.lookup(Registry.SEC_Node_Statem, node_id) != [] do
+        Process.sleep(5)
+        wait_until_unregistered(node_id)
+      end
+    end
+
+    defp start_owned_table(ctx) do
+      # Replace the table created in setup with one owned by NodeTable.Owner,
+      # as in SEC_Node_Services.
+      :ets.delete(:node_table_lookup, ctx.node_id)
+      start_supervised!({NodeTable.Owner, ctx.node_id})
+    end
+
+    test "the table and the uuid survive a crash when the description is unchanged", ctx do
+      start_owned_table(ctx)
+      drive_to_initialized(ctx)
+      before = get_state_data(ctx.node_id)
+      NodeTable.insert(ctx.node_id, {:data_report, :T, :value}, [1.0, %{}])
+
+      crash_statem(ctx.node_id)
+      Phoenix.PubSub.subscribe(:secant_client_pubsub, "descriptive_data_change")
+      drive_to_initialized(ctx)
+
+      restarted = get_state_data(ctx.node_id)
+      assert restarted.uuid == before.uuid
+      assert restarted.description == before.description
+      assert restarted.equipment_id == before.equipment_id
+      refute_received {:description_change, _, _}
+      assert NodeTable.lookup(ctx.node_id, {:data_report, :T, :value}) == {:ok, [1.0, %{}]}
+    end
+
+    test "a restarted statem gets a new uuid when the description changed", ctx do
+      start_owned_table(ctx)
+      drive_to_initialized(ctx)
+      before = get_state_data(ctx.node_id)
+
+      crash_statem(ctx.node_id)
+
+      new_description = description_with(%{T: module_with([:value])})
+
+      stub(MockTcpConnection, :send_message, fn _id, cl ->
+        if to_string(cl) == "describe .\n",
+          do: send(self(), {:describe, ".", new_description, %{}}),
+          else: auto_respond(cl)
+
+        :ok
+      end)
+
+      start_statem(ctx)
+      :ok = wait_for_state(ctx.node_id, :initialized, 1_000)
+
+      restarted = get_state_data(ctx.node_id)
+      assert restarted.uuid != before.uuid
+      assert restarted.description == new_description
+    end
+
+    test "the first start without a stored identity generates a uuid", ctx do
+      start_owned_table(ctx)
+      drive_to_initialized(ctx)
+
+      assert {:ok, %{uuid: uuid}} = NodeTable.lookup(ctx.node_id, :statem_identity)
+      assert get_state_data(ctx.node_id).uuid == uuid
+    end
+  end
 end
