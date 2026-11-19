@@ -103,8 +103,10 @@ defmodule SEC_Node_Statem do
 
     Logger.info("Starting SEC Node State Machine for: #{opts[:host]}:#{opts[:port]}")
 
-    # Create the node table here, so it exists whichever path leads to the handshake.
-    NodeTable.start(state.node_id)
+    # After a restart, pick up the identity the previous instance stored, so an
+    # unchanged description keeps its uuid. The table is owned by
+    # NodeTable.Owner and survives a crash of this process.
+    state = restore_identity(state)
 
     # No need to manually start TCP connection - supervisor handles it
     {:ok, @initial_state, state, {:next_event, :internal, :connect}}
@@ -655,8 +657,30 @@ defmodule SEC_Node_Statem do
     }
 
     NodeTable.prune(state.node_id, parsed_description)
+    store_identity(updated_state)
     publish_descriptive_data_change(updated_state, state.pubsub_topic)
     updated_state
+  end
+
+  @identity_fields [:uuid, :description, :raw_description, :equipment_id]
+
+  # Stored under its own key: SECoP_Parser overwrites :description before
+  # this process compares it, so that key cannot serve as the previous one.
+  defp store_identity(state) do
+    NodeTable.insert(state.node_id, :statem_identity, Map.take(state, @identity_fields))
+  rescue
+    error -> Logger.warning("Could not store node identity: #{inspect(error)}")
+  end
+
+  defp restore_identity(state) do
+    case NodeTable.lookup(state.node_id, :statem_identity) do
+      {:ok, identity} ->
+        Logger.info("Restored identity #{identity.uuid} for #{state.pubsub_topic}")
+        Map.merge(state, identity)
+
+      {:error, _} ->
+        state
+    end
   end
 
   defp maybe_force_disconnect(node_id) do
@@ -781,6 +805,9 @@ defmodule SEC_Node_Services do
     node_id = {opts[:host], opts[:port]}
 
     children = [
+      # Owns the node's ETS table, so values and identity survive restarts
+      # of the processes below
+      {NodeTable.Owner, node_id},
       # Buffer process for this specific node
       {Buffer, node_id},
       # TCP connection for this specific node
@@ -913,16 +940,14 @@ defmodule NodeTable do
   end
 
   def lookup(node_id, key) do
-    try do
-      {:ok, table} = get_table(node_id)
-
+    with {:ok, table} <- get_table(node_id) do
       case :ets.lookup(table, key) do
         [{_, value}] -> {:ok, value}
         [] -> {:error, :notfound}
       end
-    rescue
-      ArgumentError -> {:error, :table_not_found}
     end
+  rescue
+    ArgumentError -> {:error, :table_not_found}
   end
 
   # Delete data reports of modules and parameters that are not in the description.
@@ -954,5 +979,26 @@ defmodule NodeTable do
         Logger.error("Lookup for node_id #{inspect(node_id)} failed - no table found")
         {:error, :notfound}
     end
+  end
+end
+
+defmodule NodeTable.Owner do
+  @moduledoc """
+  Owns a node's ETS table. It runs as the first child of SEC_Node_Services,
+  so the table outlives restarts of the TCP connection and the state machine,
+  and is deleted when the node is stopped.
+  """
+  use GenServer
+
+  def start_link(node_id), do: GenServer.start_link(__MODULE__, node_id)
+
+  def child_spec(node_id) do
+    %{id: {__MODULE__, node_id}, start: {__MODULE__, :start_link, [node_id]}}
+  end
+
+  @impl true
+  def init(node_id) do
+    {:ok, _table} = NodeTable.start(node_id)
+    {:ok, node_id}
   end
 end

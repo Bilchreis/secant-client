@@ -620,14 +620,6 @@ defmodule SECNodeStatemTest do
       assert statem_pid(ctx.node_id) == pid
     end
 
-    test "the node table exists when the statem starts while TCP is down", ctx do
-      :ets.delete(:node_table_lookup, ctx.node_id)
-      start_statem(ctx)
-      :ok = wait_for_state(ctx.node_id, :disconnected, 500)
-
-      assert NodeTable.insert(ctx.node_id, :probe, 1) == {:ok, :inserted}
-    end
-
     test "a reconnect timer firing in :could_not_initialize does not crash", ctx do
       stub(MockTcpConnection, :is_connected, fn _id -> true end)
       start_statem(ctx)
@@ -647,6 +639,81 @@ defmodule SECNodeStatemTest do
 
       assert statem_pid(ctx.node_id) == pid
       assert get_state_data(ctx.node_id).state == :could_not_initialize
+    end
+  end
+
+  describe "identity across restarts" do
+    defp crash_statem(node_id) do
+      pid = statem_pid(node_id)
+      ref = Process.monitor(pid)
+      Process.exit(pid, :kill)
+      assert_receive {:DOWN, ^ref, :process, ^pid, :killed}, 1_000
+      wait_until_unregistered(node_id)
+    end
+
+    defp wait_until_unregistered(node_id) do
+      if Registry.lookup(Registry.SEC_Node_Statem, node_id) != [] do
+        Process.sleep(5)
+        wait_until_unregistered(node_id)
+      end
+    end
+
+    defp start_owned_table(ctx) do
+      # Replace the table created in setup with one owned by NodeTable.Owner,
+      # as in SEC_Node_Services.
+      :ets.delete(:node_table_lookup, ctx.node_id)
+      start_supervised!({NodeTable.Owner, ctx.node_id})
+    end
+
+    test "the table and the uuid survive a crash when the description is unchanged", ctx do
+      start_owned_table(ctx)
+      drive_to_initialized(ctx)
+      before = get_state_data(ctx.node_id)
+      NodeTable.insert(ctx.node_id, {:data_report, :T, :value}, [1.0, %{}])
+
+      crash_statem(ctx.node_id)
+      Phoenix.PubSub.subscribe(:secant_client_pubsub, "descriptive_data_change")
+      drive_to_initialized(ctx)
+
+      restarted = get_state_data(ctx.node_id)
+      assert restarted.uuid == before.uuid
+      assert restarted.description == before.description
+      assert restarted.equipment_id == before.equipment_id
+      refute_received {:description_change, _, _}
+      assert NodeTable.lookup(ctx.node_id, {:data_report, :T, :value}) == {:ok, [1.0, %{}]}
+    end
+
+    test "a restarted statem gets a new uuid when the description changed", ctx do
+      start_owned_table(ctx)
+      drive_to_initialized(ctx)
+      before = get_state_data(ctx.node_id)
+
+      crash_statem(ctx.node_id)
+
+      new_description = description_with(%{T: module_with([:value])})
+
+      stub(MockTcpConnection, :send_message, fn _id, cl ->
+        if to_string(cl) == "describe .\n",
+          do: send(self(), {:describe, ".", new_description, %{}}),
+          else: auto_respond(cl)
+
+        :ok
+      end)
+
+      start_statem(ctx)
+      :ok = wait_for_state(ctx.node_id, :initialized, 1_000)
+
+      restarted = get_state_data(ctx.node_id)
+      assert restarted.uuid != before.uuid
+      assert restarted.description == new_description
+    end
+
+    test "the first start without a stored identity generates a uuid", ctx do
+      start_owned_table(ctx)
+      drive_to_initialized(ctx)
+
+      assert {:ok, %{uuid: uuid}} = NodeTable.lookup(ctx.node_id, :statem_identity)
+      assert get_state_data(ctx.node_id).uuid == uuid
     end
   end
 end
