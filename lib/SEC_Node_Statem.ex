@@ -231,8 +231,6 @@ defmodule SEC_Node_Statem do
 
         case send_describe_message(node_id) do
           {:ok, _specifier, parsed_description, raw_description} ->
-            equipment_id = parsed_description[:properties][:equipment_id]
-
             case MapDiff.diff(parsed_description, description) do
               # Nothing changed, probably just a prior network disconnect
               %{changed: :equal, value: _} ->
@@ -252,17 +250,13 @@ defmodule SEC_Node_Statem do
                   "Descriptive data changed issuing new uuid --> connected & initialized"
                 )
 
-                updated_state_descr = %{
-                  state
-                  | description: parsed_description,
-                    raw_description: raw_description,
-                    uuid: Ecto.UUID.generate(),
-                    equipment_id: equipment_id,
-                    state: :initialized
-                }
+                updated_state_descr =
+                  apply_description_change(
+                    %{state | state: :initialized},
+                    parsed_description,
+                    raw_description
+                  )
 
-                updated_state_descr = %{updated_state_descr | state: :initialized}
-                publish_descriptive_data_change(updated_state_descr, state.pubsub_topic)
                 publish_statechange(updated_state_descr, state.pubsub_topic)
 
                 {:next_state, :initialized, updated_state_descr,
@@ -326,8 +320,6 @@ defmodule SEC_Node_Statem do
 
     case send_describe_message(node_id) do
       {:ok, _specifier, parsed_description, raw_description} ->
-        equipment_id = parsed_description[:properties][:equipment_id]
-
         case MapDiff.diff(parsed_description, description) do
           # Notihng changed, probably just a network disconnect
           %{changed: :equal, value: _} ->
@@ -338,15 +330,9 @@ defmodule SEC_Node_Statem do
           _ ->
             Logger.info("Descriptive data changed issuing new uuid")
 
-            updated_state_descr = %{
-              state
-              | description: parsed_description,
-                raw_description: raw_description,
-                uuid: Ecto.UUID.generate(),
-                equipment_id: equipment_id
-            }
+            updated_state_descr =
+              apply_description_change(state, parsed_description, raw_description)
 
-            publish_descriptive_data_change(updated_state_descr, state.pubsub_topic)
             {:keep_state, updated_state_descr, {:reply, from, {:describing, parsed_description}}}
         end
 
@@ -579,12 +565,10 @@ defmodule SEC_Node_Statem do
 
   def handle_event(
         :info,
-        {:describe, _specifier, parsed_description},
+        {:describe, _specifier, parsed_description, raw_description},
         :initialized,
         %{description: description} = state
       ) do
-    equipment_id = parsed_description[:properties][:equipment_id]
-
     case MapDiff.diff(parsed_description, description) do
       # Notihng changed, probably just a network disconnect
       %{changed: :equal, value: _} ->
@@ -595,12 +579,8 @@ defmodule SEC_Node_Statem do
       _ ->
         Logger.warning("received async Description: data changed issuing new uuid")
 
-        updated_state_descr = %{
-          state
-          | description: parsed_description,
-            uuid: Ecto.UUID.generate(),
-            equipment_id: equipment_id
-        }
+        updated_state_descr =
+          apply_description_change(state, parsed_description, raw_description)
 
         {:keep_state, updated_state_descr}
     end
@@ -619,6 +599,43 @@ defmodule SEC_Node_Statem do
   def handle_event(:info, {:changed, module, parameter, data_report}, :initialized, _state) do
     Logger.warning("received async CHANGED message #{module}:#{parameter} data: #{data_report}")
     :keep_state_and_data
+  end
+
+  # The socket can also drop before the handshake has finished. Retry the
+  # connection instead of staying in :could_not_initialize.
+  def handle_event(:info, :socket_disconnected, :could_not_initialize, state) do
+    updated_state = %{state | state: :disconnected}
+    publish_statechange(updated_state, state.pubsub_topic)
+    {:next_state, :disconnected, updated_state, {:next_event, :internal, :connect}}
+  end
+
+  # Already disconnected (or about to check the connection): nothing to do.
+  def handle_event(:info, :socket_disconnected, state_name, _state)
+      when state_name in [:connecting, :disconnected] do
+    :keep_state_and_data
+  end
+
+  # Log and drop any other message instead of crashing the state machine
+  # (and getting a new uuid on restart).
+  def handle_event(:info, message, state_name, _state) do
+    Logger.warning("Unexpected message in state #{state_name}: #{inspect(message, limit: 5)}")
+    :keep_state_and_data
+  end
+
+  # Store a changed description under a new uuid, drop values of modules and
+  # parameters that are no longer described, and announce the change.
+  defp apply_description_change(state, parsed_description, raw_description) do
+    updated_state = %{
+      state
+      | description: parsed_description,
+        raw_description: raw_description,
+        uuid: Ecto.UUID.generate(),
+        equipment_id: parsed_description[:properties][:equipment_id]
+    }
+
+    NodeTable.prune(state.node_id, parsed_description)
+    publish_descriptive_data_change(updated_state, state.pubsub_topic)
+    updated_state
   end
 
   defp maybe_force_disconnect(node_id) do
@@ -885,6 +902,26 @@ defmodule NodeTable do
     rescue
       ArgumentError -> {:error, :table_not_found}
     end
+  end
+
+  # Delete data reports of modules and parameters that are not in the description.
+  def prune(node_id, description) do
+    modules = description[:modules] || %{}
+
+    with {:ok, table} <- get_table(node_id) do
+      table
+      |> :ets.match({{:data_report, :"$1", :"$2"}, :_})
+      |> Enum.reject(fn [module, parameter] ->
+        Map.has_key?(get_in(modules, [module, :parameters]) || %{}, parameter)
+      end)
+      |> Enum.each(fn [module, parameter] ->
+        :ets.delete(table, {:data_report, module, parameter})
+      end)
+
+      :ok
+    end
+  rescue
+    ArgumentError -> {:error, :table_not_found}
   end
 
   defp get_table(node_id) do
