@@ -103,6 +103,9 @@ defmodule SEC_Node_Statem do
 
     Logger.info("Starting SEC Node State Machine for: #{opts[:host]}:#{opts[:port]}")
 
+    # Create the node table here, so it exists whichever path leads to the handshake.
+    NodeTable.start(state.node_id)
+
     # No need to manually start TCP connection - supervisor handles it
     {:ok, @initial_state, state, {:next_event, :internal, :connect}}
   end
@@ -112,7 +115,6 @@ defmodule SEC_Node_Statem do
     case @tcp_module.is_connected(node_id) do
       true ->
         updated_state = %{state | state: :connected}
-        NodeTable.start(state.node_id)
         publish_new_node(state, state.pubsub_topic)
         {:next_state, :connected, updated_state, {:next_event, :internal, :handshake}}
 
@@ -587,23 +589,46 @@ defmodule SEC_Node_Statem do
   end
 
   def handle_event(:info, {:done, module, command, data_report}, :initialized, _state) do
-    Logger.warning("received async DONE message #{module}:#{command} data: #{data_report}")
+    Logger.warning(
+      "received async DONE message #{module}:#{command} data: #{inspect(data_report)}"
+    )
+
     :keep_state_and_data
   end
 
   def handle_event(:info, {:reply, module, parameter, data_report}, :initialized, _state) do
-    Logger.warning("received async REPLY message #{module}:#{parameter} data: #{data_report}")
+    Logger.warning(
+      "received async REPLY message #{module}:#{parameter} data: #{inspect(data_report)}"
+    )
+
     :keep_state_and_data
   end
 
   def handle_event(:info, {:changed, module, parameter, data_report}, :initialized, _state) do
-    Logger.warning("received async CHANGED message #{module}:#{parameter} data: #{data_report}")
+    Logger.warning(
+      "received async CHANGED message #{module}:#{parameter} data: #{inspect(data_report)}"
+    )
+
     :keep_state_and_data
   end
 
   # The socket can also drop before the handshake has finished. Retry the
   # connection instead of staying in :could_not_initialize.
   def handle_event(:info, :socket_disconnected, :could_not_initialize, state) do
+    updated_state = %{state | state: :disconnected}
+    publish_statechange(updated_state, state.pubsub_topic)
+    {:next_state, :disconnected, updated_state, {:next_event, :internal, :connect}}
+  end
+
+  # A handshake reply that arrives after the handshake timed out, or a fresh
+  # connection, means the node may answer now: run the handshake again.
+  def handle_event(:info, message, :could_not_initialize, state)
+      when message == :socket_connected or
+             (is_tuple(message) and elem(message, 0) in [:identification, :describe]) do
+    Logger.info(
+      "Retrying handshake for #{state.pubsub_topic} after #{inspect(message, limit: 3)}"
+    )
+
     updated_state = %{state | state: :disconnected}
     publish_statechange(updated_state, state.pubsub_topic)
     {:next_state, :disconnected, updated_state, {:next_event, :internal, :connect}}

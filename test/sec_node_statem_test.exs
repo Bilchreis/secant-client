@@ -589,4 +589,43 @@ defmodule SECNodeStatemTest do
       assert statem_pid(ctx.node_id) == pid
     end
   end
+
+  describe "review follow-ups" do
+    test "a late handshake reply in :could_not_initialize retries the handshake", ctx do
+      stub(MockTcpConnection, :is_connected, fn _id -> true end)
+      start_statem(ctx)
+      :ok = wait_for_state(ctx.node_id, :could_not_initialize, 2_000)
+      pid = statem_pid(ctx.node_id)
+
+      stub(MockTcpConnection, :send_message, fn _id, cl ->
+        auto_respond(cl)
+        :ok
+      end)
+
+      inject(ctx.node_id, {:describe, ".", minimal_description(), %{}})
+
+      assert wait_for_state(ctx.node_id, :initialized, 1_000) == :ok
+      assert statem_pid(ctx.node_id) == pid
+    end
+
+    test "a late reply with a data report does not crash the statem", ctx do
+      drive_to_initialized(ctx)
+      pid = statem_pid(ctx.node_id)
+
+      inject(ctx.node_id, {:reply, "T", "value", [1.0, %{t: 1.0}]})
+      inject(ctx.node_id, {:changed, "T", "target", [1.0, %{t: 1.0}]})
+      inject(ctx.node_id, {:done, "T", "stop", [nil, %{}]})
+
+      assert get_state_data(ctx.node_id).state == :initialized
+      assert statem_pid(ctx.node_id) == pid
+    end
+
+    test "the node table exists when the statem starts while TCP is down", ctx do
+      :ets.delete(:node_table_lookup, ctx.node_id)
+      start_statem(ctx)
+      :ok = wait_for_state(ctx.node_id, :disconnected, 500)
+
+      assert NodeTable.insert(ctx.node_id, :probe, 1) == {:ok, :inserted}
+    end
+  end
 end
