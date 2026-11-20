@@ -1,0 +1,66 @@
+name: CI
+
+# Lint, compile and test. Mirrors `mix precommit`, but in check-only mode.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# A new push to a PR supersedes the previous run; runs on main always finish.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  MIX_ENV: test
+
+jobs:
+  checks:
+    name: Lint and test (${{ matrix.name }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The development toolchain from .tool-versions. The lint steps only
+          # run here: formatter output differs between Elixir versions.
+          - name: .tool-versions
+            lint: true
+          # What secant-service builds this library with (its .tool-versions).
+          - name: Elixir 1.20.1 / OTP 29.0.1
+            elixir: "1.20.1"
+            otp: "29.0.1"
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: ./.github/actions/setup-elixir
+        with:
+          elixir-version: ${{ matrix.elixir }}
+          otp-version: ${{ matrix.otp }}
+
+      - name: Compile (warnings as errors)
+        run: mix compile --warnings-as-errors
+
+      - name: Check for unused locked deps
+        if: matrix.lint
+        run: mix deps.unlock --check-unused
+
+      - name: Check formatting
+        if: matrix.lint
+        run: mix format --check-formatted
+
+      # Only Credo's warning category gates for now; the readability and
+      # refactoring backlog can be tightened later.
+      - name: Credo
+        if: matrix.lint
+        run: mix credo --only warning --strict
+
+      - name: Test
+        run: mix test

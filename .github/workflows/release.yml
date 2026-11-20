@@ -1,0 +1,105 @@
+name: Release
+
+# Bumping @version in mix.exs is the release: when main carries a version that
+# has no v<version> tag yet, this publishes the package and its docs to hex.pm,
+# then creates the tag and the GitHub release.
+#
+# Publishing uses Hex workload identity (https://hex.pm/docs/workload-identity):
+# no stored key, Hex trusts this repository, this workflow file name and the
+# `hex` environment. Renaming any of them needs the same change in the package's
+# "Workload identities" tab on hex.pm. Hex can't create a package from CI, so
+# the very first release has to be a `mix hex.publish` from a terminal.
+on:
+  push:
+    branches: [main]
+  # To retry a release that failed.
+  workflow_dispatch:
+
+# One release at a time, and never cancel a publish half way through.
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # Cheap gate that runs on every push to main, so the publish job (and any
+  # approval on its environment) only starts when there is something to release.
+  check:
+    name: Check for an unreleased version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      release: ${{ steps.version.outputs.release }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Compare mix.exs version with the tags
+        id: version
+        run: |
+          version="$(sed -n 's/^ *@version "\(.*\)"$/\1/p' mix.exs)"
+          if [ -z "$version" ]; then
+            echo "::error::Could not read @version from mix.exs"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+          if git ls-remote --exit-code --tags origin "refs/tags/v$version" > /dev/null; then
+            echo "v$version is already released."
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "v$version has no tag yet, releasing."
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  publish:
+    name: Publish v${{ needs.check.outputs.version }}
+    needs: check
+    if: needs.check.outputs.release == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    # Part of what Hex trusts, see the top of this file. Add required reviewers
+    # to the environment in the repo settings to gate publishing behind an
+    # approval.
+    environment: hex
+    permissions:
+      contents: write # create the tag and the GitHub release
+      id-token: write # the OIDC token Hex exchanges for a publish token
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # MIX_ENV stays at dev: that's where ex_doc lives, and hex.publish builds
+      # the docs.
+      - uses: ./.github/actions/setup-elixir
+
+      # The check job reads the version with sed; make sure Mix agrees before
+      # anything is published under that name.
+      - name: Check the version Mix sees
+        run: |
+          mix_version="$(mix run --no-compile --no-start -e 'IO.puts(Mix.Project.config()[:version])')"
+          if [ "$mix_version" != "$VERSION" ]; then
+            echo "::error::mix.exs version is $mix_version, expected $VERSION"
+            exit 1
+          fi
+
+      - name: Test
+        run: mix test
+        env:
+          MIX_ENV: test
+
+      # Mix exchanges the job's OIDC token for a 15 minute Hex token that can
+      # only publish this package, and prints "Authenticated with Workload
+      # Identity". Don't set HEX_API_KEY here: a key takes precedence.
+      - name: Publish package and docs
+        run: mix hex.publish --yes
+
+      # Last, so a failed publish leaves no tag and the release can be retried.
+      - name: Create the tag and GitHub release
+        run: gh release create "v$VERSION" --target "$GITHUB_SHA" --title "v$VERSION" --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}
