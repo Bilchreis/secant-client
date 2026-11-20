@@ -1,8 +1,7 @@
-defmodule SEC_Node_Statem do
+defmodule SecantClient.NodeStatem do
+  alias SecantClient.{IDN, NodeServices, NodeTable, TcpConnection}
   require Logger
-  alias NodeTable
   alias Ecto
-  alias TcpConnection
 
   @behaviour :gen_statem
 
@@ -16,7 +15,7 @@ defmodule SEC_Node_Statem do
   # Public
   def start_link(opts) do
     :gen_statem.start_link(
-      {:via, Registry, {Registry.SEC_Node_Statem, {opts[:host], opts[:port]}}},
+      {:via, Registry, {SecantClient.Registry.NodeStatem, {opts[:host], opts[:port]}}},
       __MODULE__,
       opts,
       []
@@ -41,42 +40,42 @@ defmodule SEC_Node_Statem do
   end
 
   def describe(node_id) do
-    [{sec_node_pid, _value}] = Registry.lookup(Registry.SEC_Node_Statem, node_id)
+    [{sec_node_pid, _value}] = Registry.lookup(SecantClient.Registry.NodeStatem, node_id)
     :gen_statem.call(sec_node_pid, :describe)
   end
 
   def activate(node_id) do
-    [{sec_node_pid, _value}] = Registry.lookup(Registry.SEC_Node_Statem, node_id)
+    [{sec_node_pid, _value}] = Registry.lookup(SecantClient.Registry.NodeStatem, node_id)
     :gen_statem.call(sec_node_pid, :activate)
   end
 
   def deactivate(node_id) do
-    [{sec_node_pid, _value}] = Registry.lookup(Registry.SEC_Node_Statem, node_id)
+    [{sec_node_pid, _value}] = Registry.lookup(SecantClient.Registry.NodeStatem, node_id)
     :gen_statem.call(sec_node_pid, :deactivate)
   end
 
   def change(node_id, module, parameter, value) do
-    [{sec_node_pid, _value}] = Registry.lookup(Registry.SEC_Node_Statem, node_id)
+    [{sec_node_pid, _value}] = Registry.lookup(SecantClient.Registry.NodeStatem, node_id)
     :gen_statem.call(sec_node_pid, {:change, module, parameter, value})
   end
 
   def read(node_id, module, parameter) do
-    [{sec_node_pid, _value}] = Registry.lookup(Registry.SEC_Node_Statem, node_id)
+    [{sec_node_pid, _value}] = Registry.lookup(SecantClient.Registry.NodeStatem, node_id)
     :gen_statem.call(sec_node_pid, {:read, module, parameter})
   end
 
   def ping(node_id) do
-    [{sec_node_pid, _value}] = Registry.lookup(Registry.SEC_Node_Statem, node_id)
+    [{sec_node_pid, _value}] = Registry.lookup(SecantClient.Registry.NodeStatem, node_id)
     :gen_statem.call(sec_node_pid, :ping)
   end
 
   def execute_command(node_id, module, command, value) do
-    [{sec_node_pid, _value}] = Registry.lookup(Registry.SEC_Node_Statem, node_id)
+    [{sec_node_pid, _value}] = Registry.lookup(SecantClient.Registry.NodeStatem, node_id)
     :gen_statem.call(sec_node_pid, {:do, module, command, value})
   end
 
   def execute_command(node_id, module, command) do
-    [{sec_node_pid, _value}] = Registry.lookup(Registry.SEC_Node_Statem, node_id)
+    [{sec_node_pid, _value}] = Registry.lookup(SecantClient.Registry.NodeStatem, node_id)
     :gen_statem.call(sec_node_pid, {:do, module, command, "null"})
   end
 
@@ -127,7 +126,7 @@ defmodule SEC_Node_Statem do
           )
 
           publish_new_node(:connection_failed, state.pubsub_topic)
-          SEC_Node_Services.stop(node_id)
+          NodeServices.stop(node_id)
           {:stop, :normal}
         else
           updated_state = %{state | state: :disconnected}
@@ -664,7 +663,7 @@ defmodule SEC_Node_Statem do
 
   @identity_fields [:uuid, :description, :raw_description, :equipment_id]
 
-  # Stored under its own key: SECoP_Parser overwrites :description before
+  # Stored under its own key: Parser overwrites :description before
   # this process compares it, so that key cannot serve as the previous one.
   defp store_identity(state) do
     NodeTable.insert(state.node_id, :statem_identity, Map.take(state, @identity_fields))
@@ -699,7 +698,7 @@ defmodule SEC_Node_Statem do
     @tcp_module.send_message(node_id, ~c"*IDN?\n")
 
     receive do
-      {:identification, %SECoP_IDN{} = idn} -> {:ok, idn}
+      {:identification, %IDN{} = idn} -> {:ok, idn}
     after
       @handshake_timeout -> {:error, :timeout}
     end
@@ -778,7 +777,8 @@ defmodule SEC_Node_Statem do
   end
 end
 
-defmodule SEC_Node_Services do
+defmodule SecantClient.NodeServices do
+  alias SecantClient.{Buffer, NodeStatem, NodeTable, TcpConnection}
   use Supervisor
   require Logger
 
@@ -786,12 +786,12 @@ defmodule SEC_Node_Services do
     node_id = {opts[:host], opts[:port]}
 
     Supervisor.start_link(__MODULE__, opts,
-      name: {:via, Registry, {Registry.SEC_Node_Services, node_id}}
+      name: {:via, Registry, {SecantClient.Registry.NodeServices, node_id}}
     )
   end
 
   def stop(node_id) do
-    case Registry.lookup(Registry.SEC_Node_Services, node_id) do
+    case Registry.lookup(SecantClient.Registry.NodeServices, node_id) do
       [{supervisor_pid, _}] ->
         Supervisor.stop(supervisor_pid, :normal)
 
@@ -813,12 +813,12 @@ defmodule SEC_Node_Services do
       # TCP connection for this specific node
       {TcpConnection, opts},
       # Main state machine for this node
-      {SEC_Node_Statem, opts}
+      {NodeStatem, opts}
     ]
 
-    # Use :rest_for_one strategy - if SEC_Node_Statem crashes,
+    # Use :rest_for_one strategy - if NodeStatem crashes,
     # restart it but keep TCP connection and buffer
-    # If TCP connection crashes, restart it and SEC_Node_Statem
+    # If TCP connection crashes, restart it and NodeStatem
     Supervisor.init(children, strategy: :rest_for_one)
   end
 
@@ -833,7 +833,8 @@ defmodule SEC_Node_Services do
   end
 end
 
-defmodule SEC_Node_Supervisor do
+defmodule SecantClient.NodeSupervisor do
+  alias SecantClient.{NodeServices, NodeStatem}
   # Automatically defines child_spec/1
   require Logger
   alias Jason
@@ -852,16 +853,16 @@ defmodule SEC_Node_Supervisor do
   def start_child(opts) do
     DynamicSupervisor.start_child(
       __MODULE__,
-      {SEC_Node_Services, Map.put(opts, :restart, :transient)}
+      {NodeServices, Map.put(opts, :restart, :transient)}
     )
   end
 
   def get_active_nodes() do
-    Registry.select(Registry.SEC_Node_Statem, [
+    Registry.select(SecantClient.Registry.NodeStatem, [
       {{:"$1", :"$2", :"$3"}, [], [{{:"$1", :"$2", :"$3"}}]}
     ])
     |> Enum.reduce(%{}, fn {_id, pid, _value}, acc ->
-      case SEC_Node_Statem.get_state(pid) do
+      case NodeStatem.get_state(pid) do
         {:ok, state} ->
           node_id = state.node_id
 
@@ -886,14 +887,14 @@ defmodule SEC_Node_Supervisor do
       reconnect_backoff: @reconnect_backoff
     }
 
-    case Registry.lookup(Registry.SEC_Node_Statem, {chl_ip, node_port}) do
-      [] -> DynamicSupervisor.start_child(__MODULE__, {SEC_Node_Services, opts})
+    case Registry.lookup(SecantClient.Registry.NodeStatem, {chl_ip, node_port}) do
+      [] -> DynamicSupervisor.start_child(__MODULE__, {NodeServices, opts})
       _ -> {:ok, :node_already_running}
     end
   end
 end
 
-defmodule NodeTable do
+defmodule SecantClient.NodeTable do
   require Logger
 
   @lookup_table :node_table_lookup
@@ -982,12 +983,14 @@ defmodule NodeTable do
   end
 end
 
-defmodule NodeTable.Owner do
+defmodule SecantClient.NodeTable.Owner do
   @moduledoc """
-  Owns a node's ETS table. It runs as the first child of SEC_Node_Services,
+  Owns a node's ETS table. It runs as the first child of NodeServices,
   so the table outlives restarts of the TCP connection and the state machine,
   and is deleted when the node is stopped.
   """
+
+  alias SecantClient.NodeTable
   use GenServer
 
   def start_link(node_id), do: GenServer.start_link(__MODULE__, node_id)

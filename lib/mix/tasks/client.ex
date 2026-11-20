@@ -1,6 +1,5 @@
 defmodule Mix.Tasks.Client do
   use Mix.Task
-  alias SEC_Node_Supervisor
 
   @shortdoc "Starts SecantClient.Supervisor and runs indefinitely"
 
@@ -15,11 +14,11 @@ defmodule Mix.Tasks.Client do
     #   manual: true
     # }
 
-    # SEC_Node_Supervisor.start_child(opts)
+    # NodeSupervisor.start_child(opts)
 
     # Process.sleep(3000)
 
-    # node_map = SEC_Node_Supervisor.get_active_nodes()
+    # node_map = NodeSupervisor.get_active_nodes()
 
     # all_entries = Registry.select(Registry.PlotPublisher,[{{:"$1", :"$2", :"$3"}, [], [{{:"$1", :"$2", :"$3"}}]}])
     # IO.inspect(all_entries, label: "All entries (key, PID pairs)")

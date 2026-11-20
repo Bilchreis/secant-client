@@ -1,10 +1,6 @@
 defmodule SecantClient.Supervisor do
+  alias SecantClient.{NodeDiscover, NodeSupervisor, NodeTable}
   # alias SecantClient.UdpBroadcaster
-  alias NodeDiscover
-  alias NodeTable
-  alias TcpConnection
-  alias Buffer
-  alias SEC_Node_Statem
   use Supervisor
 
   def start_link(opts \\ []) do
@@ -17,17 +13,17 @@ defmodule SecantClient.Supervisor do
 
     base_children = [
       {Phoenix.PubSub, name: :secant_client_pubsub},
-      {Registry, keys: :unique, name: Registry.Buffer},
-      {Registry, keys: :unique, name: Registry.TcpConnection},
-      {Registry, keys: :unique, name: Registry.SEC_Node_Statem},
-      {Registry, keys: :unique, name: Registry.SecNodePublisher},
-      {Registry, keys: :unique, name: Registry.SEC_Node_Services},
-      {SEC_Node_Supervisor, []}
+      {Registry, keys: :unique, name: SecantClient.Registry.Buffer},
+      {Registry, keys: :unique, name: SecantClient.Registry.TcpConnection},
+      {Registry, keys: :unique, name: SecantClient.Registry.NodeStatem},
+      {Registry, keys: :unique, name: SecantClient.Registry.NodePublisher},
+      {Registry, keys: :unique, name: SecantClient.Registry.NodeServices},
+      {NodeSupervisor, []}
     ]
 
     children =
       if Application.get_env(:secant_client, :start_node_discover, true) do
-        base_children ++ [{NodeDiscover, &SEC_Node_Supervisor.start_child_from_discovery/3}]
+        base_children ++ [{NodeDiscover, &NodeSupervisor.start_child_from_discovery/3}]
       else
         base_children
       end

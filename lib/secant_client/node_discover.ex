@@ -1,10 +1,10 @@
-defmodule SocketStruct do
+defmodule SecantClient.SocketStruct do
   defstruct socket: nil, callback: nil
 end
 
-defmodule NodeDiscover do
+defmodule SecantClient.NodeDiscover do
+  alias SecantClient.SocketStruct
   use GenServer
-  alias SocketStruct
   alias Jason
   @message "{\"SECoP\": \"discover\"}"
   # Broadcast address

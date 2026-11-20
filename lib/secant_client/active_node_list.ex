@@ -1,4 +1,4 @@
-defmodule ActiveNodeList do
+defmodule SecantClient.ActiveNodeList do
   use GenServer
   alias Jason
 

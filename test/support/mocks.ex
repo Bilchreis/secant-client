@@ -1,1 +1,1 @@
-Mox.defmock(MockTcpConnection, for: TcpConnectionBehaviour)
+Mox.defmock(MockTcpConnection, for: SecantClient.TcpConnectionBehaviour)
