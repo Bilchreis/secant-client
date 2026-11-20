@@ -1,4 +1,5 @@
-defmodule SECNodeStatemTest do
+defmodule SecantClient.NodeStatemTest do
+  alias SecantClient.{IDN, NodeStatem, NodeTable}
   use ExUnit.Case, async: false
   import Mox
 
@@ -22,11 +23,11 @@ defmodule SECNodeStatemTest do
   # ---------------------------------------------------------------------------
 
   defp start_statem(ctx) do
-    start_supervised!({SEC_Node_Statem, [host: ctx.host, port: ctx.port, restart: :temporary]})
+    start_supervised!({NodeStatem, [host: ctx.host, port: ctx.port, restart: :temporary]})
   end
 
   defp inject(node_id, msg) do
-    Registry.dispatch(Registry.SEC_Node_Statem, node_id, fn entries ->
+    Registry.dispatch(SecantClient.Registry.NodeStatem, node_id, fn entries ->
       Enum.each(entries, fn {pid, _} -> send(pid, msg) end)
     end)
   end
@@ -37,8 +38,8 @@ defmodule SECNodeStatemTest do
   end
 
   defp do_wait(node_id, expected, deadline) do
-    with [{pid, _}] <- Registry.lookup(Registry.SEC_Node_Statem, node_id),
-         {:ok, %{state: ^expected}} <- SEC_Node_Statem.get_state(pid) do
+    with [{pid, _}] <- Registry.lookup(SecantClient.Registry.NodeStatem, node_id),
+         {:ok, %{state: ^expected}} <- NodeStatem.get_state(pid) do
       :ok
     else
       _ ->
@@ -52,8 +53,8 @@ defmodule SECNodeStatemTest do
   end
 
   defp get_state_data(node_id) do
-    [{pid, _}] = Registry.lookup(Registry.SEC_Node_Statem, node_id)
-    {:ok, state} = SEC_Node_Statem.get_state(pid)
+    [{pid, _}] = Registry.lookup(SecantClient.Registry.NodeStatem, node_id)
+    {:ok, state} = NodeStatem.get_state(pid)
     state
   end
 
@@ -69,7 +70,7 @@ defmodule SECNodeStatemTest do
         send(
           self(),
           {:identification,
-           %SECoP_IDN{
+           %IDN{
              manufacturer: "ISSE",
              product: "SECoP",
              draft_date: "",
@@ -149,10 +150,10 @@ defmodule SECNodeStatemTest do
       start_statem(ctx)
       assert wait_for_state(ctx.node_id, :disconnected, 500) == :ok
 
-      assert SEC_Node_Statem.read(ctx.node_id, "M", "p") == {:error, :disconnected}
-      assert SEC_Node_Statem.change(ctx.node_id, "M", "p", "1") == {:error, :disconnected}
-      assert SEC_Node_Statem.ping(ctx.node_id) == {:error, :disconnected}
-      assert SEC_Node_Statem.execute_command(ctx.node_id, "M", "cmd") == {:error, :disconnected}
+      assert NodeStatem.read(ctx.node_id, "M", "p") == {:error, :disconnected}
+      assert NodeStatem.change(ctx.node_id, "M", "p", "1") == {:error, :disconnected}
+      assert NodeStatem.ping(ctx.node_id) == {:error, :disconnected}
+      assert NodeStatem.execute_command(ctx.node_id, "M", "cmd") == {:error, :disconnected}
     end
   end
 
@@ -169,7 +170,7 @@ defmodule SECNodeStatemTest do
         :ok
       end)
 
-      assert SEC_Node_Statem.describe(ctx.node_id) == {:describing, minimal_description()}
+      assert NodeStatem.describe(ctx.node_id) == {:describing, minimal_description()}
     end
 
     test "activate/1 sends activate and returns {:active}", ctx do
@@ -180,7 +181,7 @@ defmodule SECNodeStatemTest do
         :ok
       end)
 
-      assert SEC_Node_Statem.activate(ctx.node_id) == {:active}
+      assert NodeStatem.activate(ctx.node_id) == {:active}
     end
 
     test "deactivate/1 sends deactivate and returns {:inactive}", ctx do
@@ -191,7 +192,7 @@ defmodule SECNodeStatemTest do
         :ok
       end)
 
-      assert SEC_Node_Statem.deactivate(ctx.node_id) == {:inactive}
+      assert NodeStatem.deactivate(ctx.node_id) == {:inactive}
     end
   end
 
@@ -209,7 +210,7 @@ defmodule SECNodeStatemTest do
         :ok
       end)
 
-      assert SEC_Node_Statem.read(ctx.node_id, "T", "value") ==
+      assert NodeStatem.read(ctx.node_id, "T", "value") ==
                {:reply, "T", "value", [42.0, %{t: 1.0}]}
     end
 
@@ -222,7 +223,7 @@ defmodule SECNodeStatemTest do
         :ok
       end)
 
-      assert SEC_Node_Statem.change(ctx.node_id, "T", "target", "300.0") ==
+      assert NodeStatem.change(ctx.node_id, "T", "target", "300.0") ==
                {:changed, "T", "target", [300.0, %{t: 1.0}]}
     end
 
@@ -235,7 +236,7 @@ defmodule SECNodeStatemTest do
         :ok
       end)
 
-      assert SEC_Node_Statem.execute_command(ctx.node_id, "T", "stop") ==
+      assert NodeStatem.execute_command(ctx.node_id, "T", "stop") ==
                {:done, "T", "stop", nil}
     end
 
@@ -248,7 +249,7 @@ defmodule SECNodeStatemTest do
         :ok
       end)
 
-      assert SEC_Node_Statem.ping(ctx.node_id) == {:pong, 12_345, %{}}
+      assert NodeStatem.ping(ctx.node_id) == {:pong, 12_345, %{}}
     end
   end
 
@@ -319,7 +320,7 @@ defmodule SECNodeStatemTest do
             send(
               self(),
               {:identification,
-               %SECoP_IDN{
+               %IDN{
                  manufacturer: "ISSE",
                  product: "SECoP",
                  draft_date: "",
@@ -449,7 +450,7 @@ defmodule SECNodeStatemTest do
       assert_receive :idn_sent, 1_000
       :ok = wait_for_state(ctx.node_id, :initialized, 1_000)
 
-      assert get_state_data(ctx.node_id).idn == %SECoP_IDN{
+      assert get_state_data(ctx.node_id).idn == %IDN{
                manufacturer: "ISSE",
                product: "SECoP",
                draft_date: "",
@@ -473,7 +474,7 @@ defmodule SECNodeStatemTest do
   # ---------------------------------------------------------------------------
 
   defp statem_pid(node_id) do
-    [{pid, _}] = Registry.lookup(Registry.SEC_Node_Statem, node_id)
+    [{pid, _}] = Registry.lookup(SecantClient.Registry.NodeStatem, node_id)
     pid
   end
 
@@ -652,7 +653,7 @@ defmodule SECNodeStatemTest do
     end
 
     defp wait_until_unregistered(node_id) do
-      if Registry.lookup(Registry.SEC_Node_Statem, node_id) != [] do
+      if Registry.lookup(SecantClient.Registry.NodeStatem, node_id) != [] do
         Process.sleep(5)
         wait_until_unregistered(node_id)
       end
@@ -660,7 +661,7 @@ defmodule SECNodeStatemTest do
 
     defp start_owned_table(ctx) do
       # Replace the table created in setup with one owned by NodeTable.Owner,
-      # as in SEC_Node_Services.
+      # as in NodeServices.
       :ets.delete(:node_table_lookup, ctx.node_id)
       start_supervised!({NodeTable.Owner, ctx.node_id})
     end

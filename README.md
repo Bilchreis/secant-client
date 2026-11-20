@@ -1,23 +1,33 @@
 # SecantClient
 
-**TODO: Add description**
+[![Hex.pm](https://img.shields.io/hexpm/v/secant_client.svg)](https://hex.pm/packages/secant_client)
+[![Docs](https://img.shields.io/badge/hex-docs-blue.svg)](https://hexdocs.pm/secant_client)
+
+Client for [SECoP](https://github.com/SampleEnvironment/SECoP) (Sample
+Environment Communication Protocol) nodes.
 
 ## Installation
 
-If [available in Hex](https://hex.pm/docs/publish), the package can be installed
-by adding `secant_client` to your list of dependencies in `mix.exs`:
+Add `secant_client` to your list of dependencies in `mix.exs`:
 
 ```elixir
 def deps do
   [
-    {:secant_client, "~> 0.1.0"}
+    {:secant_client, "~> 0.4.0"}
   ]
 end
 ```
 
-Documentation can be generated with [ExDoc](https://github.com/elixir-lang/ex_doc)
-and published on [HexDocs](https://hexdocs.pm). Once published, the docs can
-be found at <https://hexdocs.pm/secant_client>.
+secant_client is a library without an application of its own. Start
+`SecantClient.Supervisor` in your supervision tree:
+
+```elixir
+children = [
+  SecantClient.Supervisor
+]
+```
+
+Documentation is at <https://hexdocs.pm/secant_client>.
 
 ## Development
 
@@ -27,9 +37,11 @@ the tests. CI runs the same checks in check-only mode.
 
 ## Releasing
 
-Bump `@version` in `mix.exs` and merge to `main`. The release workflow then
-publishes the package and its docs to hex.pm and creates the `v<version>` tag
-and GitHub release. Pushes that don't change the version release nothing.
+Bump `@version` in `mix.exs` and merge to `main`. On a new minor or major
+version, update the requirement in the Installation section too; a test fails
+until the two agree. The release workflow then publishes the package and its
+docs to hex.pm and creates the `v<version>` tag and GitHub release. Pushes that
+don't change the version release nothing.
 
 ## License
 

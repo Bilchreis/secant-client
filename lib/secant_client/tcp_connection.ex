@@ -1,6 +1,5 @@
-defmodule TcpConnection do
-  alias Buffer
-  alias BufferSupervisor
+defmodule SecantClient.TcpConnection do
+  alias SecantClient.{Buffer, TcpConnectionBehaviour}
 
   require Logger
 
@@ -13,7 +12,7 @@ defmodule TcpConnection do
 
   def start_link(opts) do
     :gen_statem.start_link(
-      {:via, Registry, {Registry.TcpConnection, {opts[:host], opts[:port]}}},
+      {:via, Registry, {SecantClient.Registry.TcpConnection, {opts[:host], opts[:port]}}},
       __MODULE__,
       opts,
       []
@@ -57,7 +56,7 @@ defmodule TcpConnection do
         :inet.setopts(socket, [{:raw, 6, 5, <<10::native-32>>}])
         :inet.setopts(socket, [{:raw, 6, 6, <<3::native-32>>}])
 
-        Registry.dispatch(Registry.SEC_Node_Statem, {host, port}, fn entries ->
+        Registry.dispatch(SecantClient.Registry.NodeStatem, {host, port}, fn entries ->
           for {pid, _} <- entries, do: send(pid, :socket_connected)
         end)
 
@@ -75,7 +74,7 @@ defmodule TcpConnection do
   end
 
   def handle_event(:info, {:tcp, _socket, data}, :connected, %{host: host, port: port} = state) do
-    [{buffer_pid, _value}] = Registry.lookup(Registry.Buffer, {host, port})
+    [{buffer_pid, _value}] = Registry.lookup(SecantClient.Registry.Buffer, {host, port})
     Buffer.receive(buffer_pid, data)
     {:keep_state, state}
   end
@@ -83,7 +82,7 @@ defmodule TcpConnection do
   def handle_event(:info, {:tcp_closed, _socket}, :connected, %{host: host, port: port} = state) do
     Logger.warning("Connection closed by server")
 
-    Registry.dispatch(Registry.SEC_Node_Statem, {host, port}, fn entries ->
+    Registry.dispatch(SecantClient.Registry.NodeStatem, {host, port}, fn entries ->
       for {pid, _} <- entries, do: send(pid, :socket_disconnected)
     end)
 
@@ -98,7 +97,7 @@ defmodule TcpConnection do
       ) do
     Logger.error("TCP error: #{inspect(reason)}")
 
-    Registry.dispatch(Registry.SEC_Node_Statem, {host, port}, fn entries ->
+    Registry.dispatch(SecantClient.Registry.NodeStatem, {host, port}, fn entries ->
       for {pid, _} <- entries, do: send(pid, :socket_disconnected)
     end)
 
@@ -137,7 +136,7 @@ defmodule TcpConnection do
   def handle_event({:call, from}, :disconnect, :connected, %{host: host, port: port} = state) do
     :gen_tcp.close(state.socket)
 
-    Registry.dispatch(Registry.SEC_Node_Statem, {host, port}, fn entries ->
+    Registry.dispatch(SecantClient.Registry.NodeStatem, {host, port}, fn entries ->
       for {pid, _} <- entries, do: send(pid, :socket_disconnected)
     end)
 
@@ -154,7 +153,7 @@ defmodule TcpConnection do
     if state.socket, do: :gen_tcp.close(state.socket)
 
     # Notify any listeners
-    Registry.dispatch(Registry.SEC_Node_Statem, {host, port}, fn entries ->
+    Registry.dispatch(SecantClient.Registry.NodeStatem, {host, port}, fn entries ->
       for {pid, _} <- entries, do: send(pid, :socket_disconnected)
     end)
 
@@ -165,24 +164,24 @@ defmodule TcpConnection do
   ## Helpers
   @impl TcpConnectionBehaviour
   def is_connected(node_id) do
-    [{conn_pid, _value}] = Registry.lookup(Registry.TcpConnection, node_id)
+    [{conn_pid, _value}] = Registry.lookup(SecantClient.Registry.TcpConnection, node_id)
     :gen_statem.call(conn_pid, :is_connected)
   end
 
   @impl TcpConnectionBehaviour
   def send_message(node_id, data) do
-    [{conn_pid, _value}] = Registry.lookup(Registry.TcpConnection, node_id)
+    [{conn_pid, _value}] = Registry.lookup(SecantClient.Registry.TcpConnection, node_id)
     :gen_statem.call(conn_pid, {:send, data})
   end
 
   @impl TcpConnectionBehaviour
   def disconnect(node_id) do
-    [{conn_pid, _value}] = Registry.lookup(Registry.TcpConnection, node_id)
+    [{conn_pid, _value}] = Registry.lookup(SecantClient.Registry.TcpConnection, node_id)
     :gen_statem.call(conn_pid, :disconnect)
   end
 
   def stop(node_id) do
-    case Registry.lookup(Registry.TcpConnection, node_id) do
+    case Registry.lookup(SecantClient.Registry.TcpConnection, node_id) do
       [{conn_pid, _}] ->
         :gen_statem.call(conn_pid, :stop)
 
@@ -192,12 +191,12 @@ defmodule TcpConnection do
   end
 end
 
-defmodule Buffer do
+defmodule SecantClient.Buffer do
   @moduledoc "Buffer the data received to parse out statements"
 
   use GenServer
   require Logger
-  alias SECoP_Parser
+  alias SecantClient.Parser
 
   @eol <<10>>
   @initial_state ""
@@ -209,7 +208,7 @@ defmodule Buffer do
     }
 
     GenServer.start_link(__MODULE__, state,
-      name: {:via, Registry, {Registry.Buffer, buffer_identifier}}
+      name: {:via, Registry, {SecantClient.Registry.Buffer, buffer_identifier}}
     )
   end
 
@@ -239,7 +238,7 @@ defmodule Buffer do
   defp process(%{buffer: buffer, node_id: node_id} = state) do
     case extract(buffer) do
       {:statement, updated_buffer, statement} ->
-        Task.start(fn -> SECoP_Parser.parse(node_id, statement) end)
+        Task.start(fn -> Parser.parse(node_id, statement) end)
         process(%{state | buffer: updated_buffer})
 
       {:nothing, updated_buffer} ->

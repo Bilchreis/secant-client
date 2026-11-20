@@ -1,4 +1,5 @@
-defmodule SECoP_Parser do
+defmodule SecantClient.Parser do
+  alias SecantClient.{IDN, NodeTable}
   require Logger
 
   alias Jason
@@ -74,14 +75,14 @@ defmodule SECoP_Parser do
     Logger.debug("IDN response received: #{idn_string}")
     [manufacturer, product, draft_date, version] = String.split(idn_string, ",", parts: 4)
 
-    struct = %SECoP_IDN{
+    struct = %IDN{
       manufacturer: manufacturer,
       product: product,
       draft_date: draft_date,
       version: version
     }
 
-    Registry.dispatch(Registry.SEC_Node_Statem, node_id, fn entries ->
+    Registry.dispatch(SecantClient.Registry.NodeStatem, node_id, fn entries ->
       for {pid, _value} <- entries, do: send(pid, {:identification, struct})
     end)
   end
@@ -134,7 +135,7 @@ defmodule SECoP_Parser do
     {:ok, :inserted} = NodeTable.insert(node_id, :description, parsed_description)
     {:ok, :inserted} = NodeTable.insert(node_id, :raw_description, description)
 
-    Registry.dispatch(Registry.SEC_Node_Statem, node_id, fn entries ->
+    Registry.dispatch(SecantClient.Registry.NodeStatem, node_id, fn entries ->
       for {pid, _value} <- entries do
         send(pid, {:describe, specifier, parsed_description, description})
       end
@@ -144,7 +145,7 @@ defmodule SECoP_Parser do
   def inactive(node_id) do
     Logger.debug("Deactivated update messages received.")
 
-    Registry.dispatch(Registry.SEC_Node_Statem, node_id, fn entries ->
+    Registry.dispatch(SecantClient.Registry.NodeStatem, node_id, fn entries ->
       for {pid, _value} <- entries do
         send(pid, {:inactive})
       end
@@ -154,7 +155,7 @@ defmodule SECoP_Parser do
   def pong(node_id, id, data) do
     Logger.debug("Pong received. ID: #{id}, Data: #{data}")
 
-    Registry.dispatch(Registry.SEC_Node_Statem, node_id, fn entries ->
+    Registry.dispatch(SecantClient.Registry.NodeStatem, node_id, fn entries ->
       for {pid, _value} <- entries do
         send(pid, {:pong, id, data})
       end
@@ -164,7 +165,7 @@ defmodule SECoP_Parser do
   def active(node_id) do
     Logger.debug("Active message received.")
 
-    Registry.dispatch(Registry.SEC_Node_Statem, node_id, fn entries ->
+    Registry.dispatch(SecantClient.Registry.NodeStatem, node_id, fn entries ->
       for {pid, _value} <- entries do
         send(pid, {:active})
       end
@@ -175,7 +176,7 @@ defmodule SECoP_Parser do
     Logger.debug("Read reply received. Specifier: #{specifier}, Data: #{data}")
     {:ok, module, parameter, data_report} = data_to_ets(node_id, specifier, data)
 
-    Registry.dispatch(Registry.SEC_Node_Statem, node_id, fn entries ->
+    Registry.dispatch(SecantClient.Registry.NodeStatem, node_id, fn entries ->
       for {pid, _value} <- entries do
         send(pid, {:reply, module, parameter, data_report})
       end
@@ -186,7 +187,7 @@ defmodule SECoP_Parser do
     Logger.debug("Parameter successfully changed. Specifier: #{specifier}, Data: #{data}")
     {:ok, module, parameter, data_report} = data_to_ets(node_id, specifier, data)
 
-    Registry.dispatch(Registry.SEC_Node_Statem, node_id, fn entries ->
+    Registry.dispatch(SecantClient.Registry.NodeStatem, node_id, fn entries ->
       for {pid, _value} <- entries do
         send(pid, {:changed, module, parameter, data_report})
       end
@@ -200,7 +201,7 @@ defmodule SECoP_Parser do
 
     {:ok, module, command} = splitSpecifier(specifier)
 
-    Registry.dispatch(Registry.SEC_Node_Statem, node_id, fn entries ->
+    Registry.dispatch(SecantClient.Registry.NodeStatem, node_id, fn entries ->
       for {pid, _value} <- entries do
         send(pid, {:done, module, command, data_report})
       end
@@ -294,7 +295,7 @@ defmodule SECoP_Parser do
     error_text = Enum.at(error_report, 1)
     error_dict = Enum.at(error_report, 2)
 
-    Registry.dispatch(Registry.SEC_Node_Statem, node_id, fn entries ->
+    Registry.dispatch(SecantClient.Registry.NodeStatem, node_id, fn entries ->
       for {pid, _value} <- entries do
         send(pid, {error_code, specifier, error_class, error_text, error_dict})
       end
