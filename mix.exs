@@ -51,10 +51,9 @@ defmodule SecantClient.MixProject do
     ]
   end
 
-  # TODO: add `licenses: [...]` (SPDX ids) and a LICENSE file. Hex refuses to
-  # publish a package without a license.
   defp package do
     [
+      licenses: ["LGPL-3.0-or-later"],
       links: %{"GitHub" => @source_url}
     ]
   end
