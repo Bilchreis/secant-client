@@ -1,6 +1,5 @@
 defmodule SECoP_Parser do
   require Logger
-  require NodeTable
 
   alias Jason
 

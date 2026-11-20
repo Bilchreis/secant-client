@@ -1,15 +1,28 @@
 defmodule SecantClient.MixProject do
   use Mix.Project
 
+  # Bumping this is the release: once it lands on main, the release workflow
+  # publishes to hex.pm and creates the v<version> tag and GitHub release.
+  @version "0.3.1"
+  @source_url "https://github.com/Bilchreis/secant-client"
+
   def project do
     [
       app: :secant_client,
-      version: "0.1.0",
+      version: @version,
       elixir: "~> 1.17",
       start_permanent: Mix.env() == :prod,
       elixirc_paths: elixirc_paths(Mix.env()),
-      deps: deps()
+      aliases: aliases(),
+      deps: deps(),
+      description: "Client for SECoP (Sample Environment Communication Protocol) nodes.",
+      package: package(),
+      docs: docs()
     ]
+  end
+
+  def cli do
+    [preferred_envs: [precommit: :test]]
   end
 
   defp elixirc_paths(:test), do: ["lib", "test/support"]
@@ -33,7 +46,38 @@ defmodule SecantClient.MixProject do
       {:map_diff, "~> 1.3"},
       {:phoenix_pubsub, "~> 2.0"},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
-      {:mox, "~> 1.0", only: :test}
+      {:mox, "~> 1.0", only: :test},
+      {:ex_doc, "~> 0.34", only: :dev, runtime: false}
+    ]
+  end
+
+  # TODO: add `licenses: [...]` (SPDX ids) and a LICENSE file. Hex refuses to
+  # publish a package without a license.
+  defp package do
+    [
+      links: %{"GitHub" => @source_url}
+    ]
+  end
+
+  defp docs do
+    [
+      main: "readme",
+      extras: ["README.md"],
+      source_url: @source_url,
+      source_ref: "v#{@version}"
+    ]
+  end
+
+  defp aliases do
+    [
+      # Run before committing. CI runs the same checks in check-only mode.
+      precommit: [
+        "compile --warnings-as-errors",
+        "deps.unlock --unused",
+        "format",
+        "credo --only warning --strict",
+        "test"
+      ]
     ]
   end
 end

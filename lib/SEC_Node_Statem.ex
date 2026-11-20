@@ -402,7 +402,7 @@ defmodule SEC_Node_Statem do
 
     Logger.info("Change Message '#{String.trim_trailing(message)}' sent")
 
-    @tcp_module.send_message(node_id, String.to_charlist(message))
+    @tcp_module.send_message(node_id, to_charlist(message))
 
     receive do
       {:changed, r_module, r_parameter, data_report} ->
@@ -428,7 +428,7 @@ defmodule SEC_Node_Statem do
     message = "do #{module}:#{command} #{value}\n"
 
     Logger.info("Do Message '#{String.trim_trailing(message)}' sent")
-    @tcp_module.send_message(node_id, String.to_charlist(message))
+    @tcp_module.send_message(node_id, to_charlist(message))
 
     receive do
       {:done, r_module, r_command, data_report} ->
@@ -457,7 +457,7 @@ defmodule SEC_Node_Statem do
     message = "read #{module}:#{parameter}\n"
 
     Logger.info("Read Message '#{String.trim_trailing(message)}' sent")
-    @tcp_module.send_message(node_id, String.to_charlist(message))
+    @tcp_module.send_message(node_id, to_charlist(message))
 
     receive do
       {:reply, r_module, r_parameter, data_report} ->
@@ -484,7 +484,7 @@ defmodule SEC_Node_Statem do
     message = "ping #{id}\n"
 
     Logger.info("Ping Message '#{String.trim_trailing(message)}' sent")
-    @tcp_module.send_message(node_id, String.to_charlist(message))
+    @tcp_module.send_message(node_id, to_charlist(message))
 
     receive do
       {:pong, id, data} ->
@@ -517,7 +517,7 @@ defmodule SEC_Node_Statem do
       id = Integer.to_string(:rand.uniform(100_000))
       message = "ping #{id}\n"
       Logger.debug("Inactivity check: sending ping #{id} to #{inspect(node_id)}")
-      @tcp_module.send_message(node_id, String.to_charlist(message))
+      @tcp_module.send_message(node_id, to_charlist(message))
 
       receive do
         {:pong, ^id, _data} ->
