@@ -38,4 +38,4 @@ COPY lib lib
 
 RUN mix compile
 
-CMD ["mix", "client"]
+CMD ["mix", "secant.client"]
