@@ -4,8 +4,11 @@ name: Release
 # has no v<version> tag yet, this publishes the package and its docs to hex.pm,
 # then creates the tag and the GitHub release.
 #
-# Needs a HEX_API_KEY secret, created with:
-#   mix hex.user key generate --key-name github-ci --permission api:write
+# Publishing uses Hex workload identity (https://hex.pm/docs/workload-identity):
+# no stored key, Hex trusts this repository, this workflow file name and the
+# `hex` environment. Renaming any of them needs the same change in the package's
+# "Workload identities" tab on hex.pm. Hex can't create a package from CI, so
+# the very first release has to be a `mix hex.publish` from a terminal.
 on:
   push:
     branches: [main]
@@ -57,11 +60,13 @@ jobs:
     if: needs.check.outputs.release == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
-    # Holds HEX_API_KEY. Add required reviewers to the environment in the repo
-    # settings to gate publishing behind an approval.
+    # Part of what Hex trusts, see the top of this file. Add required reviewers
+    # to the environment in the repo settings to gate publishing behind an
+    # approval.
     environment: hex
     permissions:
       contents: write # create the tag and the GitHub release
+      id-token: write # the OIDC token Hex exchanges for a publish token
     env:
       VERSION: ${{ needs.check.outputs.version }}
 
@@ -87,10 +92,11 @@ jobs:
         env:
           MIX_ENV: test
 
+      # Mix exchanges the job's OIDC token for a 15 minute Hex token that can
+      # only publish this package, and prints "Authenticated with Workload
+      # Identity". Don't set HEX_API_KEY here: a key takes precedence.
       - name: Publish package and docs
         run: mix hex.publish --yes
-        env:
-          HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
 
       # Last, so a failed publish leaves no tag and the release can be retried.
       - name: Create the tag and GitHub release
