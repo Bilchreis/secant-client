@@ -494,6 +494,19 @@ defmodule SecantClient.NodeStatemTest do
       assert NodeStatem.read(ctx.node_id, "T", "value") == {:error, :not_connected}
     end
 
+    test "a call to a statem that does not answer returns {:error, :timeout}", ctx do
+      drive_to_initialized(ctx)
+      pid = statem_pid(ctx.node_id)
+      :ok = :sys.suspend(pid)
+
+      try do
+        # call_timeout (200 ms) + the 1 s margin
+        assert NodeStatem.read(ctx.node_id, "T", "value") == {:error, :timeout}
+      after
+        :sys.resume(pid)
+      end
+    end
+
     test "calls for an unknown node return {:error, :not_found}" do
       assert NodeStatem.read({~c"nowhere", 1}, "T", "value") == {:error, :not_found}
     end

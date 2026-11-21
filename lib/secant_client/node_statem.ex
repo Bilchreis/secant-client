@@ -6,8 +6,17 @@ defmodule SecantClient.NodeStatem do
   Requests (`read/3`, `change/4`, `execute_command/4`, `ping/1`, `describe/1`,
   `activate/1`, `deactivate/1`) do not block the state machine. Each waits in
   the state under a key of its kind and specifier, and the node's answer goes
-  to the oldest request with the same key. A request that times out keeps its
-  place for a while, so a late answer cannot answer a retry.
+  to the oldest request with the same key, so an answer never goes to a
+  request for another specifier.
+
+  A request that times out keeps its place for `stale_reply_ttl`, so its late
+  answer is dropped instead of answering a retry of the same request. SECoP
+  replies carry no request id, though, so a lost answer and a late one look
+  the same. To keep one lost answer from making every retry time out, a retry
+  whose answer may have been dropped this way does not keep its place when it
+  times out in turn. A node that always answers later than the timeout can
+  therefore still have a late answer taken by the next retry of the same
+  request.
 
   State changes are published on `:secant_client_pubsub`.
   """
