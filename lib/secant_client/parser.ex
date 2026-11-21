@@ -1,8 +1,15 @@
 defmodule SecantClient.Parser do
+  @moduledoc """
+  Parses SECoP messages, one line at a time.
+
+  Data reports are stored in the node's `SecantClient.NodeTable` and published
+  on `:secant_client_pubsub` as `{:value_update, module, accessible, report}`
+  on `"value_update:<host>:<port>"` (errors as `{:error_update, ...}` on
+  `"error_update:<host>:<port>"`). Replies to requests are sent to the node's
+  `SecantClient.NodeStatem`.
+  """
   alias SecantClient.{IDN, NodeTable}
   require Logger
-
-  alias Jason
 
   def parse(node_id, message) do
     trimmed = String.trim(message)
@@ -87,7 +94,7 @@ defmodule SecantClient.Parser do
     end)
   end
 
-  defp splitSpecifier(specifier) do
+  defp split_specifier(specifier) do
     case String.split(specifier, ":", parts: 2) do
       [module, parameter] -> {:ok, module, parameter}
       _ -> {:error, :no_match}
@@ -119,7 +126,7 @@ defmodule SecantClient.Parser do
 
   defp data_to_ets(node_id, specifier, data, extra_entries \\ []) do
     {:ok, data_report} = decode_report(data)
-    {:ok, module, accessible} = splitSpecifier(specifier)
+    {:ok, module, accessible} = split_specifier(specifier)
 
     with {:ok, module_atom} <- existing_atom(module),
          {:ok, accessible_atom} <- existing_atom(accessible) do
@@ -128,14 +135,14 @@ defmodule SecantClient.Parser do
           {{:data_report, module_atom, accessible_atom}, data_report} | extra_entries
         ])
 
-      Phoenix.PubSub.broadcast(
+      Phoenix.PubSub.local_broadcast(
         :secant_client_pubsub,
         "value_update:#{elem(node_id, 0)}:#{elem(node_id, 1)}",
         {:value_update, module, accessible, data_report}
       )
     else
       :error ->
-        Logger.warning("Data report for undescribed accessible #{specifier} dropped")
+        Logger.debug("Data report for undescribed accessible #{specifier} dropped")
     end
 
     {:ok, module, accessible, data_report}
@@ -225,7 +232,7 @@ defmodule SecantClient.Parser do
 
     {:ok, data_report} = decode_report(data)
 
-    {:ok, module, command} = splitSpecifier(specifier)
+    {:ok, module, command} = split_specifier(specifier)
 
     Registry.dispatch(SecantClient.Registry.NodeStatem, node_id, fn entries ->
       for {pid, _value} <- entries do
@@ -295,11 +302,11 @@ defmodule SecantClient.Parser do
   def error_update(node_id, specifier, data) do
     {:ok, error_report} = decode_report(data)
 
-    Logger.warning(
+    Logger.debug(fn ->
       "Error update message received. Specifier: #{specifier}, Data: #{inspect(error_report)}"
-    )
+    end)
 
-    {:ok, module, accessible} = splitSpecifier(specifier)
+    {:ok, module, accessible} = split_specifier(specifier)
 
     with {:ok, module_atom} <- existing_atom(module),
          {:ok, accessible_atom} <- existing_atom(accessible) do
@@ -310,13 +317,13 @@ defmodule SecantClient.Parser do
           {:error_report, error_report}
         )
 
-      Phoenix.PubSub.broadcast(
+      Phoenix.PubSub.local_broadcast(
         :secant_client_pubsub,
         "error_update:#{elem(node_id, 0)}:#{elem(node_id, 1)}",
         {:error_update, module, accessible, error_report}
       )
     else
-      :error -> Logger.warning("Error report for undescribed accessible #{specifier} dropped")
+      :error -> Logger.debug("Error report for undescribed accessible #{specifier} dropped")
     end
   end
 

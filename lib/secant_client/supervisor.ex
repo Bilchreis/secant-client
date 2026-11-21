@@ -1,6 +1,10 @@
 defmodule SecantClient.Supervisor do
+  @moduledoc """
+  The top of the secant_client supervision tree. Start it in the host
+  application's supervision tree.
+  """
+
   alias SecantClient.{NodeDiscover, NodeSupervisor, NodeTable}
-  # alias SecantClient.UdpBroadcaster
   use Supervisor
 
   def start_link(opts \\ []) do
@@ -15,7 +19,6 @@ defmodule SecantClient.Supervisor do
       {Phoenix.PubSub, name: :secant_client_pubsub},
       {Registry, keys: :unique, name: SecantClient.Registry.TcpConnection},
       {Registry, keys: :unique, name: SecantClient.Registry.NodeStatem},
-      {Registry, keys: :unique, name: SecantClient.Registry.NodePublisher},
       {Registry, keys: :unique, name: SecantClient.Registry.NodeServices},
       {NodeSupervisor, []}
     ]

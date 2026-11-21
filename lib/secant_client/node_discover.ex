@@ -1,11 +1,17 @@
 defmodule SecantClient.SocketStruct do
+  @moduledoc false
   defstruct socket: nil, callback: nil
 end
 
 defmodule SecantClient.NodeDiscover do
+  @moduledoc """
+  Finds SEC nodes on the local network with the SECoP UDP discovery broadcast,
+  at start and every minute, and calls the callback for every node that
+  answers with `callback.(ip, port, message)`.
+  """
+
   alias SecantClient.SocketStruct
   use GenServer
-  alias Jason
   @message "{\"SECoP\": \"discover\"}"
   # Broadcast address
   @broadcast_address {255, 255, 255, 255}
@@ -50,15 +56,16 @@ defmodule SecantClient.NodeDiscover do
 
   @impl true
   def handle_info({:udp, _socket, ip, port, message}, socketstruct) do
-    ip_string = :inet.ntoa(ip) |> to_string()
-    discover_map = Jason.decode!(message)
+    # Any host can send a datagram to this port: ignore what is not a node's
+    # answer instead of crashing.
+    case Jason.decode(message) do
+      {:ok, %{"port" => node_port}} when is_integer(node_port) ->
+        Logger.info("Node Discovered at #{:inet.ntoa(ip)}:#{node_port}")
+        socketstruct.callback.(ip, port, message)
 
-    node_port = Map.get(discover_map, "port")
-
-    Logger.info("Node Discovered at #{ip_string}:#{node_port}")
-
-    # Invoke the callback function
-    socketstruct.callback.(ip, port, message)
+      _ ->
+        Logger.debug("Ignored discovery datagram from #{:inet.ntoa(ip)}:#{port}")
+    end
 
     {:noreply, socketstruct}
   end

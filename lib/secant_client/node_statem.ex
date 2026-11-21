@@ -1,7 +1,19 @@
 defmodule SecantClient.NodeStatem do
+  @moduledoc """
+  The state machine of one SEC node: it waits for the connection, runs the
+  handshake (`*IDN?`, `describe`, `activate`) and sends requests to the node.
+
+  Requests (`read/3`, `change/4`, `execute_command/4`, `ping/1`, `describe/1`,
+  `activate/1`, `deactivate/1`) do not block the state machine. Each waits in
+  the state under a key of its kind and specifier, and the node's answer goes
+  to the oldest request with the same key. A request that times out keeps its
+  place for a while, so a late answer cannot answer a retry.
+
+  State changes are published on `:secant_client_pubsub`.
+  """
+
   alias SecantClient.{IDN, NodeServices, NodeTable, TcpConnection}
   require Logger
-  alias Ecto
 
   @behaviour :gen_statem
 
@@ -11,6 +23,8 @@ defmodule SecantClient.NodeStatem do
   @reconnect_timeout Application.compile_env(:secant_client, :reconnect_timeout, 5_000)
   @call_timeout Application.compile_env(:secant_client, :call_timeout, 5_000)
   @handshake_timeout Application.compile_env(:secant_client, :handshake_timeout, 15_000)
+  # How long a timed-out request still takes its late answer
+  @stale_reply_ttl Application.compile_env(:secant_client, :stale_reply_ttl, @call_timeout)
 
   # Error replies and the request they answer.
   @error_requests %{
@@ -94,7 +108,7 @@ defmodule SecantClient.NodeStatem do
       description: nil,
       raw_description: nil,
       active: false,
-      uuid: Ecto.UUID.generate(),
+      uuid: generate_uuid(),
       error: false,
       state: :disconnected,
       manual: opts[:manual] || false,
@@ -118,7 +132,7 @@ defmodule SecantClient.NodeStatem do
 
   @impl :gen_statem
   def handle_event(:internal, :connect, :connecting, %{node_id: node_id, manual: manual} = state) do
-    case @tcp_module.is_connected(node_id) do
+    case @tcp_module.connected?(node_id) do
       true ->
         updated_state = %{state | state: :connected}
         publish_new_node(state, state.pubsub_topic)
@@ -144,7 +158,7 @@ defmodule SecantClient.NodeStatem do
   end
 
   def handle_event(:internal, :connect, :disconnected, %{node_id: node_id} = state) do
-    case @tcp_module.is_connected(node_id) do
+    case @tcp_module.connected?(node_id) do
       true ->
         updated_state = %{state | state: :connected}
         publish_statechange(updated_state, state.pubsub_topic)
@@ -237,9 +251,9 @@ defmodule SecantClient.NodeStatem do
 
         case send_describe_message(node_id) do
           {:ok, _specifier, parsed_description, raw_description} ->
-            case MapDiff.diff(parsed_description, description) do
+            case parsed_description === description do
               # Nothing changed, probably just a prior network disconnect
-              %{changed: :equal, value: _} ->
+              true ->
                 Logger.info("Descriptive data constant --> connected & initialized")
                 updated_state = %{state | state: :initialized}
                 publish_statechange(updated_state, state.pubsub_topic)
@@ -251,7 +265,7 @@ defmodule SecantClient.NodeStatem do
                  ]}
 
               # Description changed update uuid, equipment_id and description
-              _ ->
+              false ->
                 Logger.info(
                   "Descriptive data changed issuing new uuid --> connected & initialized"
                 )
@@ -329,14 +343,27 @@ defmodule SecantClient.NodeStatem do
     {:keep_state_and_data, {:reply, from, {:error, :uninitialized}}}
   end
 
-  # No answer within the request timeout.
+  # No answer within the request timeout. The entry stays in its place in the
+  # queue as :stale for @stale_reply_ttl, so a late answer is taken by it and
+  # cannot answer a retry of the same request.
   def handle_event({:timeout, {:request, ref}}, key, _state_name, state) do
-    case pop_pending(state, key, ref) do
-      {nil, _state} ->
+    case List.keyfind(Map.get(state.pending, key, []), ref, 0) do
+      nil ->
         :keep_state_and_data
 
-      {from, state} ->
-        {:keep_state, state, timeout_actions(from, key, state)}
+      {^ref, :stale} ->
+        {_from, state} = pop_pending(state, key, ref)
+        {:keep_state, state}
+
+      {^ref, from} ->
+        pending = Map.update!(state.pending, key, &List.keyreplace(&1, ref, 0, {ref, :stale}))
+        state = %{state | pending: pending}
+
+        {:keep_state, state,
+         [
+           {{:timeout, {:request, ref}}, @stale_reply_ttl, key}
+           | timeout_actions(from, key, state)
+         ]}
     end
   end
 
@@ -387,14 +414,14 @@ defmodule SecantClient.NodeStatem do
         %{description: description} = state
       ) do
     state =
-      case MapDiff.diff(parsed_description, description) do
+      case parsed_description === description do
         # Nothing changed, probably just a network disconnect
-        %{changed: :equal, value: _} ->
+        true ->
           Logger.info("Descriptive data constant")
           state
 
         # Description changed update uuid, equipment_id and description
-        _ ->
+        false ->
           Logger.info("Descriptive data changed issuing new uuid")
           apply_description_change(state, parsed_description, raw_description)
       end
@@ -477,7 +504,7 @@ defmodule SecantClient.NodeStatem do
       state
       | description: parsed_description,
         raw_description: raw_description,
-        uuid: Ecto.UUID.generate(),
+        uuid: generate_uuid(),
         equipment_id: parsed_description[:properties][:equipment_id]
     }
 
@@ -608,6 +635,11 @@ defmodule SecantClient.NodeStatem do
     end
   end
 
+  defp reply_actions(:stale, reply) do
+    Logger.debug("Dropped late reply to a timed-out request: #{inspect(reply, limit: 5)}")
+    []
+  end
+
   defp reply_actions(:internal, _reply), do: []
   defp reply_actions(:inactivity, _reply), do: [inactivity_timer()]
   defp reply_actions(from, reply), do: [{:reply, from, reply}]
@@ -628,6 +660,7 @@ defmodule SecantClient.NodeStatem do
 
   defp timeout_actions(from, _key, _state), do: [{:reply, from, {:error, :timeout}}]
 
+  # Removes the entry `ref` and returns who waited for it.
   defp pop_pending(state, key, ref) do
     entries = Map.get(state.pending, key, [])
 
@@ -651,7 +684,7 @@ defmodule SecantClient.NodeStatem do
     {%{state | pending: %{}}, actions}
   end
 
-  defp failure_actions(from, _reply) when from in [:internal, :inactivity], do: []
+  defp failure_actions(from, _reply) when from in [:internal, :inactivity, :stale], do: []
   defp failure_actions(from, reply), do: [{:reply, from, reply}]
 
   defp inactivity_timer, do: {{:timeout, :inactivity_check}, @inactivity_timeout, nil}
@@ -661,6 +694,14 @@ defmodule SecantClient.NodeStatem do
   defp set_active(state, active) do
     publish_secop_conn_state(active, state.pubsub_topic)
     %{state | active: active}
+  end
+
+  # A random (version 4) UUID.
+  defp generate_uuid do
+    <<a::48, _::4, b::12, _::2, c::62>> = :crypto.strong_rand_bytes(16)
+    hex = Base.encode16(<<a::48, 4::4, b::12, 2::2, c::62>>, case: :lower)
+    <<p1::binary-8, p2::binary-4, p3::binary-4, p4::binary-4, p5::binary-12>> = hex
+    Enum.join([p1, p2, p3, p4, p5], "-")
   end
 
   defp publish_descriptive_data_change(state, pubsub_topic) do
@@ -701,235 +742,5 @@ defmodule SecantClient.NodeStatem do
       "new_node",
       {:new_node, pubsub_topic, state}
     )
-  end
-end
-
-defmodule SecantClient.NodeServices do
-  alias SecantClient.{NodeStatem, NodeTable, TcpConnection}
-  use Supervisor
-  require Logger
-
-  def start_link(opts) do
-    node_id = {opts[:host], opts[:port]}
-
-    Supervisor.start_link(__MODULE__, opts,
-      name: {:via, Registry, {SecantClient.Registry.NodeServices, node_id}}
-    )
-  end
-
-  def stop(node_id) do
-    case Registry.lookup(SecantClient.Registry.NodeServices, node_id) do
-      [{supervisor_pid, _}] ->
-        Supervisor.stop(supervisor_pid, :normal)
-
-      [] ->
-        {:error, :not_found}
-    end
-  end
-
-  @impl true
-  def init(opts) do
-    node_id = {opts[:host], opts[:port]}
-
-    children = [
-      # Owns the node's ETS table, so values and identity survive restarts
-      # of the processes below
-      {NodeTable.Owner, node_id},
-      # TCP connection for this specific node; it also parses the lines it receives
-      {TcpConnection, opts},
-      # Main state machine for this node
-      {NodeStatem, opts}
-    ]
-
-    # Use :rest_for_one strategy - if NodeStatem crashes,
-    # restart it but keep the TCP connection
-    # If TCP connection crashes, restart it and NodeStatem
-    Supervisor.init(children, strategy: :rest_for_one)
-  end
-
-  def child_spec(opts) do
-    %{
-      id: {opts[:host], opts[:port]},
-      start: {__MODULE__, :start_link, [opts]},
-      type: :supervisor,
-      restart: :transient,
-      shutdown: :infinity
-    }
-  end
-end
-
-defmodule SecantClient.NodeSupervisor do
-  alias SecantClient.{NodeServices, NodeStatem}
-  # Automatically defines child_spec/1
-  require Logger
-  alias Jason
-  use DynamicSupervisor
-  @reconnect_backoff 5000
-
-  def start_link(init_arg) do
-    DynamicSupervisor.start_link(__MODULE__, init_arg, name: __MODULE__)
-  end
-
-  @impl true
-  def init(_init_arg) do
-    DynamicSupervisor.init(strategy: :one_for_one)
-  end
-
-  def start_child(opts) do
-    DynamicSupervisor.start_child(
-      __MODULE__,
-      {NodeServices, Map.put(opts, :restart, :transient)}
-    )
-  end
-
-  def get_active_nodes() do
-    Registry.select(SecantClient.Registry.NodeStatem, [
-      {{:"$1", :"$2", :"$3"}, [], [{{:"$1", :"$2", :"$3"}}]}
-    ])
-    |> Enum.reduce(%{}, fn {_id, pid, _value}, acc ->
-      case NodeStatem.get_state(pid) do
-        {:ok, state} ->
-          node_id = state.node_id
-
-          Map.put(acc, node_id, state)
-
-        _ ->
-          acc
-      end
-    end)
-  end
-
-  def start_child_from_discovery(ip, _port, discovery_message) do
-    discover_map = Jason.decode!(discovery_message)
-
-    chl_ip = ip |> Tuple.to_list() |> Enum.join(".") |> String.to_charlist()
-
-    node_port = Map.get(discover_map, "port")
-
-    opts = %{
-      host: chl_ip,
-      port: node_port,
-      reconnect_backoff: @reconnect_backoff
-    }
-
-    case Registry.lookup(SecantClient.Registry.NodeStatem, {chl_ip, node_port}) do
-      [] -> DynamicSupervisor.start_child(__MODULE__, {NodeServices, opts})
-      _ -> {:ok, :node_already_running}
-    end
-  end
-end
-
-defmodule SecantClient.NodeTable do
-  require Logger
-
-  @lookup_table :node_table_lookup
-
-  def init_lookup_table do
-    :ets.new(@lookup_table, [:set, :public, :named_table])
-    :ok
-  rescue
-    ArgumentError ->
-      :ok
-  end
-
-  def start(node_id) do
-    case :ets.lookup(@lookup_table, node_id) do
-      [{_, table}] ->
-        if :ets.info(table) != :undefined do
-          {:ok, table}
-        else
-          # Owner process crashed and ETS deleted the table; remove stale entry and recreate.
-          :ets.delete(@lookup_table, node_id)
-          start(node_id)
-        end
-
-      [] ->
-        table = :ets.new(:ets_table, [:set, :public, read_concurrency: true])
-
-        case :ets.insert_new(@lookup_table, {node_id, table}) do
-          true ->
-            {:ok, table}
-
-          false ->
-            :ets.delete(table)
-            get_table(node_id)
-        end
-    end
-  end
-
-  def insert(node_id, key, value), do: insert(node_id, [{key, value}])
-
-  # Insert several {key, value} entries with one table lookup.
-  def insert(node_id, entries) when is_list(entries) do
-    {:ok, table} = get_table(node_id)
-
-    true = :ets.insert(table, entries)
-
-    {:ok, :inserted}
-  end
-
-  def lookup(node_id, key) do
-    with {:ok, table} <- get_table(node_id) do
-      case :ets.lookup(table, key) do
-        [{_, value}] -> {:ok, value}
-        [] -> {:error, :notfound}
-      end
-    end
-  rescue
-    ArgumentError -> {:error, :table_not_found}
-  end
-
-  # Delete data reports of modules and parameters that are not in the description.
-  def prune(node_id, description) do
-    modules = description[:modules] || %{}
-
-    with {:ok, table} <- get_table(node_id) do
-      table
-      |> :ets.match({{:data_report, :"$1", :"$2"}, :_})
-      |> Enum.reject(fn [module, parameter] ->
-        Map.has_key?(get_in(modules, [module, :parameters]) || %{}, parameter)
-      end)
-      |> Enum.each(fn [module, parameter] ->
-        :ets.delete(table, {:data_report, module, parameter})
-      end)
-
-      :ok
-    end
-  rescue
-    ArgumentError -> {:error, :table_not_found}
-  end
-
-  defp get_table(node_id) do
-    case :ets.lookup(@lookup_table, node_id) do
-      [{_, table}] ->
-        {:ok, table}
-
-      [] ->
-        Logger.error("Lookup for node_id #{inspect(node_id)} failed - no table found")
-        {:error, :notfound}
-    end
-  end
-end
-
-defmodule SecantClient.NodeTable.Owner do
-  @moduledoc """
-  Owns a node's ETS table. It runs as the first child of NodeServices,
-  so the table outlives restarts of the TCP connection and the state machine,
-  and is deleted when the node is stopped.
-  """
-
-  alias SecantClient.NodeTable
-  use GenServer
-
-  def start_link(node_id), do: GenServer.start_link(__MODULE__, node_id)
-
-  def child_spec(node_id) do
-    %{id: {__MODULE__, node_id}, start: {__MODULE__, :start_link, [node_id]}}
-  end
-
-  @impl true
-  def init(node_id) do
-    {:ok, _table} = NodeTable.start(node_id)
-    {:ok, node_id}
   end
 end

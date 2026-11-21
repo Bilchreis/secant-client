@@ -1,4 +1,16 @@
 defmodule SecantClient.TcpConnection do
+  @moduledoc """
+  Owns the TCP socket of one SEC node and reconnects when it drops.
+
+  Received data is split into lines here and each line is handed to
+  `SecantClient.Parser` in arrival order. The socket runs in `{:active, N}`
+  mode, so a node that floods the connection cannot grow the mailbox without
+  bound: after N messages the socket pauses until they have been parsed.
+
+  The node's `SecantClient.NodeStatem` is told about the connection with
+  `:socket_connected` and `:socket_disconnected` messages.
+  """
+
   alias SecantClient.{Parser, TcpConnectionBehaviour}
 
   require Logger
@@ -7,6 +19,10 @@ defmodule SecantClient.TcpConnection do
   @behaviour TcpConnectionBehaviour
 
   @initial_state :disconnected
+  # Messages delivered before the socket pauses for the parser to catch up
+  @active_n 100
+  @connect_timeout 5_000
+  @call_timeout 5_000
 
   ## Public API
 
@@ -19,17 +35,42 @@ defmodule SecantClient.TcpConnection do
     )
   end
 
-  ## Callbacks
-
   def child_spec(opts) do
     %{
       id: __MODULE__,
       start: {__MODULE__, :start_link, [opts]},
-      type: :worker,
       restart: :transient,
       shutdown: 500
     }
   end
+
+  @impl TcpConnectionBehaviour
+  def connected?(node_id), do: call(node_id, :connected?) == true
+
+  @impl TcpConnectionBehaviour
+  def send_message(node_id, data), do: call(node_id, {:send, data})
+
+  @impl TcpConnectionBehaviour
+  def disconnect(node_id), do: call(node_id, :disconnect)
+
+  def stop(node_id), do: call(node_id, :stop)
+
+  defp call(node_id, request) do
+    case Registry.lookup(SecantClient.Registry.TcpConnection, node_id) do
+      [{pid, _value}] ->
+        try do
+          :gen_statem.call(pid, request, @call_timeout)
+        catch
+          :exit, {:timeout, _} -> {:error, :timeout}
+          :exit, {reason, _} when reason in [:noproc, :normal, :shutdown] -> {:error, :not_found}
+        end
+
+      [] ->
+        {:error, :not_found}
+    end
+  end
+
+  ## Callbacks
 
   @impl :gen_statem
   def callback_mode, do: :handle_event_function
@@ -39,6 +80,7 @@ defmodule SecantClient.TcpConnection do
     state = %{
       host: opts[:host],
       port: opts[:port],
+      node_id: {opts[:host], opts[:port]},
       socket: nil,
       # Bytes received after the last complete line
       buffer: "",
@@ -49,8 +91,10 @@ defmodule SecantClient.TcpConnection do
   end
 
   @impl :gen_statem
-  def handle_event(:internal, :connect, :disconnected, %{host: host, port: port} = state) do
-    case :gen_tcp.connect(state.host, state.port, [:binary, active: true, keepalive: true]) do
+  def handle_event(:internal, :connect, :disconnected, state) do
+    options = [:binary, active: @active_n, keepalive: true]
+
+    case :gen_tcp.connect(state.host, state.port, options, @connect_timeout) do
       {:ok, socket} ->
         # TCP_KEEPIDLE=30s, TCP_KEEPINTVL=10s, TCP_KEEPCNT=3 (Linux: SOL_TCP=6, opts 4/5/6)
         # Dead connection detected within ~60s; setopts returns {:error,_} on non-Linux, safe to ignore
@@ -58,116 +102,91 @@ defmodule SecantClient.TcpConnection do
         :inet.setopts(socket, [{:raw, 6, 5, <<10::native-32>>}])
         :inet.setopts(socket, [{:raw, 6, 6, <<3::native-32>>}])
 
-        Registry.dispatch(SecantClient.Registry.NodeStatem, {host, port}, fn entries ->
-          for {pid, _} <- entries, do: send(pid, :socket_connected)
-        end)
-
+        notify_statem(state.node_id, :socket_connected)
         Logger.info("Connected to #{state.host}:#{state.port}")
-        {:next_state, :connected, %{state | socket: socket}}
+        {:next_state, :connected, %{state | socket: socket, buffer: ""}}
 
       {:error, reason} ->
-        Logger.error("Failed to connect: #{inspect(reason)}")
-        {:keep_state, state, {{:timeout, :reconnect}, state.reconnect_backoff, nil}}
+        Logger.error("Failed to connect to #{state.host}:#{state.port}: #{inspect(reason)}")
+        {:keep_state_and_data, {{:timeout, :reconnect}, state.reconnect_backoff, nil}}
     end
   end
 
-  def handle_event({:timeout, :reconnect}, nil, :disconnected, state) do
-    {:keep_state, state, {:next_event, :internal, :connect}}
+  def handle_event({:timeout, :reconnect}, nil, :disconnected, _state) do
+    {:keep_state_and_data, {:next_event, :internal, :connect}}
   end
+
+  def handle_event({:timeout, :reconnect}, nil, _state_name, _state), do: :keep_state_and_data
 
   # Lines are parsed here, in the order they arrive, so updates of the same
-  # parameter are applied in order.
-  def handle_event(:info, {:tcp, _socket, data}, :connected, state) do
-    {:keep_state, %{state | buffer: handle_data(state.buffer, data, {state.host, state.port})}}
+  # parameter are applied in order. Only messages of the current socket are
+  # handled; a closed socket can still have messages in the mailbox.
+  def handle_event(:info, {:tcp, socket, data}, :connected, %{socket: socket} = state) do
+    {:keep_state, %{state | buffer: handle_data(state.buffer, data, state.node_id)}}
   end
 
-  def handle_event(:info, {:tcp_closed, _socket}, :connected, %{host: host, port: port} = state) do
-    Logger.warning("Connection closed by server")
-
-    Registry.dispatch(SecantClient.Registry.NodeStatem, {host, port}, fn entries ->
-      for {pid, _} <- entries, do: send(pid, :socket_disconnected)
-    end)
-
-    {:next_state, :disconnected, %{state | socket: nil, buffer: ""},
-     {:next_event, :internal, :connect}}
+  def handle_event(:info, {:tcp_passive, socket}, :connected, %{socket: socket}) do
+    :ok = :inet.setopts(socket, active: @active_n)
+    :keep_state_and_data
   end
 
-  def handle_event(
-        :info,
-        {:tcp_error, _socket, reason},
-        :connected,
-        %{host: host, port: port} = state
-      ) do
-    Logger.error("TCP error: #{inspect(reason)}")
+  def handle_event(:info, {:tcp_closed, socket}, :connected, %{socket: socket} = state) do
+    Logger.warning("Connection to #{state.host}:#{state.port} closed by server")
+    close(state)
+  end
 
-    Registry.dispatch(SecantClient.Registry.NodeStatem, {host, port}, fn entries ->
-      for {pid, _} <- entries, do: send(pid, :socket_disconnected)
-    end)
+  def handle_event(:info, {:tcp_error, socket, reason}, :connected, %{socket: socket} = state) do
+    Logger.error("TCP error on #{state.host}:#{state.port}: #{inspect(reason)}")
+    close(state)
+  end
 
-    {:next_state, :disconnected, %{state | socket: nil, buffer: ""},
-     {:next_event, :internal, :connect}}
+  def handle_event(:info, message, _state_name, _state) do
+    Logger.debug("Dropped message of a previous socket: #{inspect(message, limit: 3)}")
+    :keep_state_and_data
   end
 
   def handle_event({:call, from}, {:send, data}, :connected, state) do
-    # Logger.info("sending data: #{data}")
-
-    case :gen_tcp.send(state.socket, data) do
-      :ok ->
-        :gen_statem.reply(from, :ok)
-
-      {:error, reason} ->
-        :gen_statem.reply(from, {:error, reason})
-    end
-
-    {:keep_state, state}
+    {:keep_state_and_data, {:reply, from, :gen_tcp.send(state.socket, data)}}
   end
 
-  # Handle send attempts while disconnected
-  def handle_event({:call, from}, {:send, _message}, :disconnected, _state) do
+  def handle_event({:call, from}, {:send, _data}, :disconnected, _state) do
     {:keep_state_and_data, {:reply, from, {:error, :not_connected}}}
   end
 
-  def handle_event({:call, from}, :is_connected, :connected, state) do
-    :gen_statem.reply(from, true)
-    {:keep_state, state}
+  def handle_event({:call, from}, :connected?, state_name, _state) do
+    {:keep_state_and_data, {:reply, from, state_name == :connected}}
   end
 
-  def handle_event({:call, from}, :is_connected, :disconnected, state) do
-    :gen_statem.reply(from, false)
-    {:keep_state, state}
+  def handle_event({:call, from}, :disconnect, :connected, state) do
+    {:next_state, :disconnected, data, actions} = close(state)
+    {:next_state, :disconnected, data, [{:reply, from, :ok} | List.wrap(actions)]}
   end
 
-  def handle_event({:call, from}, :disconnect, :connected, %{host: host, port: port} = state) do
+  def handle_event({:call, from}, :disconnect, :disconnected, _state) do
+    {:keep_state_and_data, {:reply, from, :ok}}
+  end
+
+  def handle_event({:call, from}, :stop, _state_name, state) do
+    if state.socket, do: :gen_tcp.close(state.socket)
+    notify_statem(state.node_id, :socket_disconnected)
+    {:stop_and_reply, :normal, {:reply, from, :ok}}
+  end
+
+  defp close(state) do
     :gen_tcp.close(state.socket)
-
-    Registry.dispatch(SecantClient.Registry.NodeStatem, {host, port}, fn entries ->
-      for {pid, _} <- entries, do: send(pid, :socket_disconnected)
-    end)
-
-    :gen_statem.reply(from, :ok)
+    notify_statem(state.node_id, :socket_disconnected)
 
     {:next_state, :disconnected, %{state | socket: nil, buffer: ""},
      {:next_event, :internal, :connect}}
   end
 
-  def handle_event({:call, from}, :disconnect, :disconnected, state) do
-    {:keep_state, state, {:reply, from, :ok}}
-  end
-
-  def handle_event({:call, from}, :stop, _state, %{host: host, port: port} = state) do
-    # Close socket if connected
-    if state.socket, do: :gen_tcp.close(state.socket)
-
-    # Notify any listeners
-    Registry.dispatch(SecantClient.Registry.NodeStatem, {host, port}, fn entries ->
-      for {pid, _} <- entries, do: send(pid, :socket_disconnected)
+  defp notify_statem(node_id, message) do
+    Registry.dispatch(SecantClient.Registry.NodeStatem, node_id, fn entries ->
+      for {pid, _} <- entries, do: send(pid, message)
     end)
-
-    :gen_statem.reply(from, :ok)
-    {:stop, :normal, state}
   end
 
-  ## Helpers
+  ## Line framing
 
   @doc false
   # Appends `data` to `buffer`, parses every complete line and returns the
@@ -197,33 +216,5 @@ defmodule SecantClient.TcpConnection do
         "Could not parse message from #{inspect(node_id)}: #{Exception.message(error)} " <>
           "line: #{inspect(line, printable_limit: 200)}"
       )
-  end
-
-  @impl TcpConnectionBehaviour
-  def is_connected(node_id) do
-    [{conn_pid, _value}] = Registry.lookup(SecantClient.Registry.TcpConnection, node_id)
-    :gen_statem.call(conn_pid, :is_connected)
-  end
-
-  @impl TcpConnectionBehaviour
-  def send_message(node_id, data) do
-    [{conn_pid, _value}] = Registry.lookup(SecantClient.Registry.TcpConnection, node_id)
-    :gen_statem.call(conn_pid, {:send, data})
-  end
-
-  @impl TcpConnectionBehaviour
-  def disconnect(node_id) do
-    [{conn_pid, _value}] = Registry.lookup(SecantClient.Registry.TcpConnection, node_id)
-    :gen_statem.call(conn_pid, :disconnect)
-  end
-
-  def stop(node_id) do
-    case Registry.lookup(SecantClient.Registry.TcpConnection, node_id) do
-      [{conn_pid, _}] ->
-        :gen_statem.call(conn_pid, :stop)
-
-      [] ->
-        {:error, :not_found}
-    end
   end
 end
