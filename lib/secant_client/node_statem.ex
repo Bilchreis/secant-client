@@ -1,7 +1,28 @@
 defmodule SecantClient.NodeStatem do
+  @moduledoc """
+  The state machine of one SEC node: it waits for the connection, runs the
+  handshake (`*IDN?`, `describe`, `activate`) and sends requests to the node.
+
+  Requests (`read/3`, `change/4`, `execute_command/4`, `ping/1`, `describe/1`,
+  `activate/1`, `deactivate/1`) do not block the state machine. Each waits in
+  the state under a key of its kind and specifier, and the node's answer goes
+  to the oldest request with the same key, so an answer never goes to a
+  request for another specifier.
+
+  A request that times out keeps its place for `stale_reply_ttl`, so its late
+  answer is dropped instead of answering a retry of the same request. SECoP
+  replies carry no request id, though, so a lost answer and a late one look
+  the same. To keep one lost answer from making every retry time out, a retry
+  whose answer may have been dropped this way does not keep its place when it
+  times out in turn. A node that always answers later than the timeout can
+  therefore still have a late answer taken by the next retry of the same
+  request.
+
+  State changes are published on `:secant_client_pubsub`.
+  """
+
   alias SecantClient.{IDN, NodeServices, NodeTable, TcpConnection}
   require Logger
-  alias Ecto
 
   @behaviour :gen_statem
 
@@ -11,6 +32,19 @@ defmodule SecantClient.NodeStatem do
   @reconnect_timeout Application.compile_env(:secant_client, :reconnect_timeout, 5_000)
   @call_timeout Application.compile_env(:secant_client, :call_timeout, 5_000)
   @handshake_timeout Application.compile_env(:secant_client, :handshake_timeout, 15_000)
+  # How long a timed-out request still takes its late answer
+  @stale_reply_ttl Application.compile_env(:secant_client, :stale_reply_ttl, @call_timeout)
+
+  # Error replies and the request they answer.
+  @error_requests %{
+    error_change: :change,
+    error_read: :read,
+    error_do: :do,
+    error_ping: :ping,
+    error_activate: :activate,
+    error_deactivate: :deactivate,
+    error_describe: :describe
+  }
 
   # Public
   def start_link(opts) do
@@ -39,44 +73,42 @@ defmodule SecantClient.NodeStatem do
     :gen_statem.call(pid, :get_state)
   end
 
-  def describe(node_id) do
-    [{sec_node_pid, _value}] = Registry.lookup(SecantClient.Registry.NodeStatem, node_id)
-    :gen_statem.call(sec_node_pid, :describe)
-  end
+  def describe(node_id), do: call(node_id, :describe)
 
-  def activate(node_id) do
-    [{sec_node_pid, _value}] = Registry.lookup(SecantClient.Registry.NodeStatem, node_id)
-    :gen_statem.call(sec_node_pid, :activate)
-  end
+  def activate(node_id), do: call(node_id, :activate)
 
-  def deactivate(node_id) do
-    [{sec_node_pid, _value}] = Registry.lookup(SecantClient.Registry.NodeStatem, node_id)
-    :gen_statem.call(sec_node_pid, :deactivate)
-  end
+  def deactivate(node_id), do: call(node_id, :deactivate)
 
-  def change(node_id, module, parameter, value) do
-    [{sec_node_pid, _value}] = Registry.lookup(SecantClient.Registry.NodeStatem, node_id)
-    :gen_statem.call(sec_node_pid, {:change, module, parameter, value})
-  end
+  def change(node_id, module, parameter, value),
+    do: call(node_id, {:change, module, parameter, value})
 
-  def read(node_id, module, parameter) do
-    [{sec_node_pid, _value}] = Registry.lookup(SecantClient.Registry.NodeStatem, node_id)
-    :gen_statem.call(sec_node_pid, {:read, module, parameter})
-  end
+  def read(node_id, module, parameter), do: call(node_id, {:read, module, parameter})
 
-  def ping(node_id) do
-    [{sec_node_pid, _value}] = Registry.lookup(SecantClient.Registry.NodeStatem, node_id)
-    :gen_statem.call(sec_node_pid, :ping)
-  end
+  def ping(node_id), do: call(node_id, :ping)
 
-  def execute_command(node_id, module, command, value) do
-    [{sec_node_pid, _value}] = Registry.lookup(SecantClient.Registry.NodeStatem, node_id)
-    :gen_statem.call(sec_node_pid, {:do, module, command, value})
-  end
+  def execute_command(node_id, module, command, value \\ "null"),
+    do: call(node_id, {:do, module, command, value})
 
-  def execute_command(node_id, module, command) do
-    [{sec_node_pid, _value}] = Registry.lookup(SecantClient.Registry.NodeStatem, node_id)
-    :gen_statem.call(sec_node_pid, {:do, module, command, "null"})
+  # The statem answers a request within its request timeout. Wait a little
+  # longer, so the caller gets {:error, :timeout} instead of an exit.
+  @call_margin 1_000
+
+  defp call(node_id, request) do
+    case Registry.lookup(SecantClient.Registry.NodeStatem, node_id) do
+      [{pid, _value}] ->
+        {_key, _line, timeout} = request_spec(request)
+
+        try do
+          :gen_statem.call(pid, request, timeout + @call_margin)
+        catch
+          # Busy in the handshake, or stopped while the request waited
+          :exit, {:timeout, _} -> {:error, :timeout}
+          :exit, {_reason, _} -> {:error, :not_found}
+        end
+
+      [] ->
+        {:error, :not_found}
+    end
   end
 
   # callbacks
@@ -92,12 +124,19 @@ defmodule SecantClient.NodeStatem do
       description: nil,
       raw_description: nil,
       active: false,
-      uuid: Ecto.UUID.generate(),
+      uuid: generate_uuid(),
       error: false,
       state: :disconnected,
       manual: opts[:manual] || false,
       last_seen_update_ts: nil,
-      idn: nil
+      idn: nil,
+      # Requests waiting for the node's answer: key => [{timer_ref, from}],
+      # oldest first. See send_request/4.
+      pending: %{},
+      # Refs of requests whose answer a stale entry may have taken. They do
+      # not go stale when they time out, so one lost answer cannot make
+      # every retry of the same request time out.
+      unsure: MapSet.new()
     }
 
     Logger.info("Starting SEC Node State Machine for: #{opts[:host]}:#{opts[:port]}")
@@ -113,7 +152,7 @@ defmodule SecantClient.NodeStatem do
 
   @impl :gen_statem
   def handle_event(:internal, :connect, :connecting, %{node_id: node_id, manual: manual} = state) do
-    case @tcp_module.is_connected(node_id) do
+    case @tcp_module.connected?(node_id) do
       true ->
         updated_state = %{state | state: :connected}
         publish_new_node(state, state.pubsub_topic)
@@ -139,7 +178,7 @@ defmodule SecantClient.NodeStatem do
   end
 
   def handle_event(:internal, :connect, :disconnected, %{node_id: node_id} = state) do
-    case @tcp_module.is_connected(node_id) do
+    case @tcp_module.connected?(node_id) do
       true ->
         updated_state = %{state | state: :connected}
         publish_statechange(updated_state, state.pubsub_topic)
@@ -162,9 +201,11 @@ defmodule SecantClient.NodeStatem do
   end
 
   def handle_event(:info, :socket_disconnected, :initialized, state) do
-    updated_state = %{state | state: :disconnected}
+    {updated_state, actions} =
+      fail_pending(%{state | state: :disconnected}, {:error, :disconnected})
+
     publish_statechange(updated_state, state.pubsub_topic)
-    {:next_state, :disconnected, updated_state, {:next_event, :internal, :connect}}
+    {:next_state, :disconnected, updated_state, [{:next_event, :internal, :connect} | actions]}
   end
 
   def handle_event(:info, :socket_disconnected, :connected, state) do
@@ -230,9 +271,9 @@ defmodule SecantClient.NodeStatem do
 
         case send_describe_message(node_id) do
           {:ok, _specifier, parsed_description, raw_description} ->
-            case MapDiff.diff(parsed_description, description) do
+            case parsed_description === description do
               # Nothing changed, probably just a prior network disconnect
-              %{changed: :equal, value: _} ->
+              true ->
                 Logger.info("Descriptive data constant --> connected & initialized")
                 updated_state = %{state | state: :initialized}
                 publish_statechange(updated_state, state.pubsub_topic)
@@ -244,7 +285,7 @@ defmodule SecantClient.NodeStatem do
                  ]}
 
               # Description changed update uuid, equipment_id and description
-              _ ->
+              false ->
                 Logger.info(
                   "Descriptive data changed issuing new uuid --> connected & initialized"
                 )
@@ -286,15 +327,10 @@ defmodule SecantClient.NodeStatem do
     end
   end
 
-  def handle_event(:internal, :activate, :initialized, %{node_id: node_id} = state) do
-    case send_activate_message(node_id) do
-      {:ok, :active} ->
-        publish_secop_conn_state(true, state.pubsub_topic)
-        updated_state = %{state | active: true}
-        {:keep_state, updated_state}
-
-      {:error, _} ->
-        {:keep_state_and_data, []}
+  def handle_event(:internal, :activate, :initialized, state) do
+    case send_request(state, :activate, :internal) do
+      {:ok, state, action} -> {:keep_state, state, action}
+      {:error, _reason} -> :keep_state_and_data
     end
   end
 
@@ -309,194 +345,44 @@ defmodule SecantClient.NodeStatem do
     {:keep_state_and_data, {:reply, from, {:ok, state}}}
   end
 
-  def handle_event(
-        {:call, from},
-        :describe,
-        :initialized,
-        %{node_id: node_id, description: description} = state
-      ) do
-    Logger.info("Describe Message sent")
+  # Requests to the node. The answer arrives later as an info message and is
+  # matched to the request by its key (see handle_reply/3), so the statem
+  # keeps handling other events while it waits.
+  def handle_event({:call, from}, request, :initialized, state) when request != :get_state do
+    Logger.info("#{inspect(request)} sent to #{state.pubsub_topic}")
 
-    case send_describe_message(node_id) do
-      {:ok, _specifier, parsed_description, raw_description} ->
-        case MapDiff.diff(parsed_description, description) do
-          # Notihng changed, probably just a network disconnect
-          %{changed: :equal, value: _} ->
-            Logger.info("Descriptive data constant")
-            {:keep_state_and_data, {:reply, from, {:describing, parsed_description}}}
+    case send_request(state, request, from) do
+      {:ok, state, action} -> {:keep_state, state, action}
+      {:error, reason} -> {:keep_state_and_data, {:reply, from, {:error, reason}}}
+    end
+  end
 
-          # Description changed update uuid, equipment_id and description
-          _ ->
-            Logger.info("Descriptive data changed issuing new uuid")
+  def handle_event({:call, from}, request, :could_not_initialize, _state)
+      when request != :get_state do
+    Logger.warning("Node call before initialization: #{inspect(request)}")
+    {:keep_state_and_data, {:reply, from, {:error, :uninitialized}}}
+  end
 
-            updated_state_descr =
-              apply_description_change(state, parsed_description, raw_description)
+  # No answer within the request timeout. The entry stays in its place in the
+  # queue as :stale for @stale_reply_ttl, so a late answer is taken by it and
+  # cannot answer a retry of the same request. A request whose answer a stale
+  # entry may already have taken is removed instead, which ends the chain.
+  def handle_event({:timeout, {:request, ref}}, key, _state_name, state) do
+    case List.keyfind(Map.get(state.pending, key, []), ref, 0) do
+      nil ->
+        :keep_state_and_data
 
-            {:keep_state, updated_state_descr, {:reply, from, {:describing, parsed_description}}}
+      {^ref, :stale} ->
+        {_from, state} = pop_pending(state, key, ref)
+        {:keep_state, state}
+
+      {^ref, from} ->
+        if MapSet.member?(state.unsure, ref) do
+          {from, state} = pop_pending(state, key, ref)
+          {:keep_state, state, timeout_actions(from, key, state)}
+        else
+          mark_stale(state, key, ref, from)
         end
-
-      {:error, :timeout} ->
-        Logger.warning(
-          "NO answer on describe message for #{elem(node_id, 0)}:#{elem(node_id, 1)}, going into ERROR state"
-        )
-
-        {:keep_state_and_data, {:reply, from, {:error, :timeout}}}
-
-      {:error, {specifier, error_class, error_text, error_dict}} ->
-        Logger.error("Error on describe request: #{error_text}")
-
-        {:keep_state_and_data,
-         {:reply, from, {:error, :describe, specifier, error_class, error_text, error_dict}}}
-    end
-  end
-
-  def handle_event({:call, from}, :activate, :initialized, %{node_id: node_id} = state) do
-    Logger.info("Activate Message sent")
-
-    case send_activate_message(node_id) do
-      {:ok, :active} ->
-        updated_state = %{state | active: true}
-        publish_secop_conn_state(true, state.pubsub_topic)
-        {:keep_state, updated_state, {:reply, from, {:active}}}
-
-      {:error, :timeout} ->
-        {:keep_state_and_data, {:reply, from, {:error, :timeout}}}
-
-      {:error, {specifier, error_class, error_text, error_dict}} ->
-        Logger.error("Error on activate request: #{error_text}")
-
-        {:keep_state_and_data,
-         {:reply, from, {:error, :activate, specifier, error_class, error_text, error_dict}}}
-    end
-  end
-
-  def handle_event({:call, from}, :deactivate, :initialized, %{node_id: node_id} = state) do
-    Logger.info("Deactivate Message sent")
-    @tcp_module.send_message(node_id, ~c"deactivate\n")
-
-    receive do
-      {:inactive} ->
-        Logger.info("Node Inactive")
-        updated_state = %{state | active: false}
-        publish_secop_conn_state(false, state.pubsub_topic)
-        {:keep_state, updated_state, {:reply, from, {:inactive}}}
-
-      {:error_deactivate, specifier, error_class, error_text, error_dict} ->
-        Logger.error("Error on deactivate request: #{error_text}")
-
-        {:keep_state_and_data,
-         {:reply, from, {:error, :deactivate, specifier, error_class, error_text, error_dict}}}
-    after
-      @call_timeout -> {:keep_state_and_data, {:reply, from, {:error, :timeout}}}
-    end
-  end
-
-  def handle_event(
-        {:call, from},
-        {:change, module, parameter, value},
-        :initialized,
-        %{node_id: node_id} = _state
-      ) do
-    message = "change #{module}:#{parameter} #{value}\n"
-
-    Logger.info("Change Message '#{String.trim_trailing(message)}' sent")
-
-    @tcp_module.send_message(node_id, to_charlist(message))
-
-    receive do
-      {:changed, r_module, r_parameter, data_report} ->
-        Logger.info("Value of #{r_module}:#{r_module} changed to #{Jason.encode!(data_report)}")
-        {:keep_state_and_data, {:reply, from, {:changed, r_module, r_parameter, data_report}}}
-
-      {:error_change, specifier, error_class, error_text, error_dict} ->
-        Logger.error("Error on change request: #{error_text}")
-
-        {:keep_state_and_data,
-         {:reply, from, {:error, :change, specifier, error_class, error_text, error_dict}}}
-    after
-      @call_timeout -> {:keep_state_and_data, {:reply, from, {:error, :timeout}}}
-    end
-  end
-
-  def handle_event(
-        {:call, from},
-        {:do, module, command, value},
-        :initialized,
-        %{node_id: node_id} = _state
-      ) do
-    message = "do #{module}:#{command} #{value}\n"
-
-    Logger.info("Do Message '#{String.trim_trailing(message)}' sent")
-    @tcp_module.send_message(node_id, to_charlist(message))
-
-    receive do
-      {:done, r_module, r_command, data_report} ->
-        Logger.info(
-          "Command #{module}:#{command} executed and returned: #{Jason.encode!(data_report)}"
-        )
-
-        {:keep_state_and_data, {:reply, from, {:done, r_module, r_command, data_report}}}
-
-      {:error_do, specifier, error_class, error_text, error_dict} ->
-        Logger.error("Error on do request: #{error_text}")
-
-        {:keep_state_and_data,
-         {:reply, from, {:error, :do, specifier, error_class, error_text, error_dict}}}
-    after
-      @call_timeout -> {:keep_state_and_data, {:reply, from, {:error, :timeout}}}
-    end
-  end
-
-  def handle_event(
-        {:call, from},
-        {:read, module, parameter},
-        :initialized,
-        %{node_id: node_id} = _state
-      ) do
-    message = "read #{module}:#{parameter}\n"
-
-    Logger.info("Read Message '#{String.trim_trailing(message)}' sent")
-    @tcp_module.send_message(node_id, to_charlist(message))
-
-    receive do
-      {:reply, r_module, r_parameter, data_report} ->
-        Logger.info(
-          "Read request #{module}:#{parameter} sent and returned: #{Jason.encode!(data_report)}"
-        )
-
-        {:keep_state_and_data, {:reply, from, {:reply, r_module, r_parameter, data_report}}}
-
-      {:error_read, specifier, error_class, error_text, error_dict} ->
-        Logger.error("Error on read request: #{error_text}")
-
-        {:keep_state_and_data,
-         {:reply, from, {:error, :read, specifier, error_class, error_text, error_dict}}}
-    after
-      @call_timeout -> {:keep_state_and_data, {:reply, from, {:error, :timeout}}}
-    end
-  end
-
-  def handle_event({:call, from}, :ping, :initialized, %{node_id: node_id} = _state) do
-    # generate random id
-    id = Enum.random(1..100_000)
-
-    message = "ping #{id}\n"
-
-    Logger.info("Ping Message '#{String.trim_trailing(message)}' sent")
-    @tcp_module.send_message(node_id, to_charlist(message))
-
-    receive do
-      {:pong, id, data} ->
-        Logger.info("Corresponding Pong received: #{Jason.encode!(data)}")
-        {:keep_state_and_data, {:reply, from, {:pong, id, data}}}
-
-      {:error_ping, specifier, error_class, error_text, error_dict} ->
-        Logger.error("Error on ping request: #{error_text}")
-
-        {:keep_state_and_data,
-         {:reply, from, {:error, :ping, specifier, error_class, error_text, error_dict}}}
-    after
-      @call_timeout -> {:keep_state_and_data, {:reply, from, {:error, :timeout}}}
     end
   end
 
@@ -513,31 +399,14 @@ defmodule SecantClient.NodeStatem do
       end
 
     if current_ts == last_seen do
-      id = Integer.to_string(:rand.uniform(100_000))
-      message = "ping #{id}\n"
-      Logger.debug("Inactivity check: sending ping #{id} to #{inspect(node_id)}")
-      @tcp_module.send_message(node_id, to_charlist(message))
+      Logger.debug("Inactivity check: sending ping to #{inspect(node_id)}")
 
-      receive do
-        {:pong, ^id, _data} ->
-          Logger.debug("Inactivity check: pong #{id} received from #{inspect(node_id)}")
-          {:keep_state_and_data, {{:timeout, :inactivity_check}, @inactivity_timeout, nil}}
-
-        {:error_ping, _specifier, _error_class, error_text, _error_dict} ->
-          Logger.warning("Inactivity check ping error for #{inspect(node_id)}: #{error_text}")
-          {:keep_state_and_data, {{:timeout, :inactivity_check}, @inactivity_timeout, nil}}
-      after
-        @call_timeout ->
-          Logger.warning(
-            "Inactivity check timed out for #{inspect(node_id)}, checking for queued socket events"
-          )
-
-          maybe_force_disconnect(node_id)
-          {:keep_state_and_data, {{:timeout, :inactivity_check}, @inactivity_timeout, nil}}
+      case send_request(state, :ping, :inactivity) do
+        {:ok, state, action} -> {:keep_state, state, action}
+        {:error, _reason} -> {:keep_state_and_data, inactivity_timer()}
       end
     else
-      {:keep_state, %{state | last_seen_update_ts: current_ts},
-       {{:timeout, :inactivity_check}, @inactivity_timeout, nil}}
+      {:keep_state, %{state | last_seen_update_ts: current_ts}, inactivity_timer()}
     end
   end
 
@@ -546,20 +415,15 @@ defmodule SecantClient.NodeStatem do
   end
 
   def handle_event(:info, {:active}, :initialized, state) do
-    Logger.warning("received async ACTIVE message")
-    updated_state = %{state | active: true}
-    {:keep_state, updated_state}
+    state |> set_active(true) |> handle_reply(:activate, {:active})
   end
 
   def handle_event(:info, {:inactive}, :initialized, state) do
-    Logger.warning("received async INACTIVE message")
-    updated_state = %{state | active: false}
-    {:keep_state, updated_state}
+    state |> set_active(false) |> handle_reply(:deactivate, {:inactive})
   end
 
-  def handle_event(:info, {:pong, id, data}, :initialized, _state) do
-    Logger.warning("received async PONG message id:#{id}, data:#{data}")
-    :keep_state_and_data
+  def handle_event(:info, {:pong, id, data}, :initialized, state) do
+    handle_reply(state, {:ping, id}, {:pong, id, data})
   end
 
   def handle_event(
@@ -568,45 +432,53 @@ defmodule SecantClient.NodeStatem do
         :initialized,
         %{description: description} = state
       ) do
-    case MapDiff.diff(parsed_description, description) do
-      # Notihng changed, probably just a network disconnect
-      %{changed: :equal, value: _} ->
-        Logger.warning("received async Description: data constant")
-        :keep_state_and_data
+    state =
+      case parsed_description === description do
+        # Nothing changed, probably just a network disconnect
+        true ->
+          Logger.info("Descriptive data constant")
+          state
 
-      # Description changed update uuid, equipment_id and description
-      _ ->
-        Logger.warning("received async Description: data changed issuing new uuid")
-
-        updated_state_descr =
+        # Description changed update uuid, equipment_id and description
+        false ->
+          Logger.info("Descriptive data changed issuing new uuid")
           apply_description_change(state, parsed_description, raw_description)
+      end
 
-        {:keep_state, updated_state_descr}
-    end
+    handle_reply(state, :describe, {:describing, parsed_description})
   end
 
-  def handle_event(:info, {:done, module, command, data_report}, :initialized, _state) do
-    Logger.warning(
-      "received async DONE message #{module}:#{command} data: #{inspect(data_report)}"
-    )
-
-    :keep_state_and_data
+  def handle_event(:info, {:done, module, command, data_report}, :initialized, state) do
+    handle_reply(state, {:do, module, command}, {:done, module, command, data_report})
   end
 
-  def handle_event(:info, {:reply, module, parameter, data_report}, :initialized, _state) do
-    Logger.warning(
-      "received async REPLY message #{module}:#{parameter} data: #{inspect(data_report)}"
-    )
-
-    :keep_state_and_data
+  def handle_event(:info, {:reply, module, parameter, data_report}, :initialized, state) do
+    handle_reply(state, {:read, module, parameter}, {:reply, module, parameter, data_report})
   end
 
-  def handle_event(:info, {:changed, module, parameter, data_report}, :initialized, _state) do
-    Logger.warning(
-      "received async CHANGED message #{module}:#{parameter} data: #{inspect(data_report)}"
+  def handle_event(:info, {:changed, module, parameter, data_report}, :initialized, state) do
+    handle_reply(
+      state,
+      {:change, module, parameter},
+      {:changed, module, parameter, data_report}
     )
+  end
 
-    :keep_state_and_data
+  def handle_event(
+        :info,
+        {error_code, specifier, error_class, error_text, error_dict},
+        :initialized,
+        state
+      )
+      when is_map_key(@error_requests, error_code) do
+    request = Map.fetch!(@error_requests, error_code)
+    Logger.error("Error on #{request} request #{specifier}: #{inspect(error_text)}")
+
+    handle_reply(
+      state,
+      error_key(request, specifier),
+      {:error, request, specifier, error_class, error_text, error_dict}
+    )
   end
 
   # The socket can also drop before the handshake has finished. Retry the
@@ -651,7 +523,7 @@ defmodule SecantClient.NodeStatem do
       state
       | description: parsed_description,
         raw_description: raw_description,
-        uuid: Ecto.UUID.generate(),
+        uuid: generate_uuid(),
         equipment_id: parsed_description[:properties][:equipment_id]
     }
 
@@ -682,18 +554,6 @@ defmodule SecantClient.NodeStatem do
     end
   end
 
-  defp maybe_force_disconnect(node_id) do
-    {:messages, msgs} = :erlang.process_info(self(), :messages)
-
-    if :socket_disconnected not in msgs do
-      Logger.warning(
-        "No socket event after inactivity timeout for #{inspect(node_id)}, forcing TCP disconnect"
-      )
-
-      @tcp_module.disconnect(node_id)
-    end
-  end
-
   defp send_idn_message(node_id) do
     @tcp_module.send_message(node_id, ~c"*IDN?\n")
 
@@ -713,27 +573,182 @@ defmodule SecantClient.NodeStatem do
         {:ok, specifier, parsed_description, raw_description}
 
       {:error_describe, specifier, error_class, error_text, error_dict} ->
-        Logger.error("Error on describe request: #{error_text}")
+        Logger.error("Error on describe request: #{inspect(error_text)}")
         {:error, {specifier, error_class, error_text, error_dict}}
     after
       @handshake_timeout -> {:error, :timeout}
     end
   end
 
-  defp send_activate_message(node_id) do
-    @tcp_module.send_message(node_id, ~c"activate\n")
+  # -- Requests to the node ---------------------------------------------------
 
-    receive do
-      {:active} ->
-        Logger.info("Node Activated")
-        {:ok, :active}
+  # {key, line, timeout} of a request. A reply is matched to the oldest
+  # pending request with the same key, so a late reply cannot answer a
+  # request for another specifier.
+  defp request_spec({:change, module, parameter, value}),
+    do:
+      {{:change, to_string(module), to_string(parameter)},
+       "change #{module}:#{parameter} #{value}\n", @call_timeout}
 
-      {:error_activate, specifier, error_class, error_text, error_dict} ->
-        Logger.error("Error on activate request: #{error_text}")
-        {:error, {specifier, error_class, error_text, error_dict}}
-    after
-      @handshake_timeout -> {:error, :timeout}
+  defp request_spec({:read, module, parameter}),
+    do:
+      {{:read, to_string(module), to_string(parameter)}, "read #{module}:#{parameter}\n",
+       @call_timeout}
+
+  defp request_spec({:do, module, command, value}),
+    do:
+      {{:do, to_string(module), to_string(command)}, "do #{module}:#{command} #{value}\n",
+       @call_timeout}
+
+  defp request_spec(:ping) do
+    id = Integer.to_string(:rand.uniform(100_000))
+    {{:ping, id}, "ping #{id}\n", @call_timeout}
+  end
+
+  defp request_spec(:activate), do: {:activate, "activate\n", @handshake_timeout}
+  defp request_spec(:deactivate), do: {:deactivate, "deactivate\n", @call_timeout}
+  defp request_spec(:describe), do: {:describe, "describe .\n", @handshake_timeout}
+
+  defp error_key(request, specifier) when request in [:change, :read, :do] do
+    case String.split(specifier, ":", parts: 2) do
+      [module, accessible] -> {request, module, accessible}
+      _ -> {request, specifier}
     end
+  end
+
+  defp error_key(:ping, id), do: {:ping, id}
+  defp error_key(request, _specifier), do: request
+
+  # Sends a request and records `from` until the matching reply or the
+  # request timeout. `from` is a gen_statem caller, :internal (activate after
+  # the handshake) or :inactivity (the inactivity ping).
+  defp send_request(state, request, from) do
+    {key, line, timeout} = request_spec(request)
+
+    case @tcp_module.send_message(state.node_id, to_charlist(line)) do
+      :ok ->
+        ref = make_ref()
+        entry = {ref, from}
+        pending = Map.update(state.pending, key, [entry], &(&1 ++ [entry]))
+        {:ok, %{state | pending: pending}, {{:timeout, {:request, ref}}, timeout, key}}
+
+      {:error, reason} ->
+        Logger.warning("Could not send #{inspect(request)}: #{inspect(reason)}")
+        {:error, reason}
+    end
+  end
+
+  # Answers the oldest pending request with `key`. A reply without one is
+  # late (its request timed out) or unsolicited and is dropped.
+  defp handle_reply(state, key, reply) do
+    case Map.get(state.pending, key, []) do
+      [] ->
+        Logger.debug("Dropped reply without a pending request: #{inspect(reply, limit: 5)}")
+        {:keep_state, state}
+
+      # The answer may be the late one of the stale request, or the answer to
+      # a newer request: drop it, and keep the newer ones from going stale.
+      [{ref, :stale} | rest] ->
+        newer = for {newer_ref, from} <- rest, from != :stale, do: newer_ref
+
+        state = %{
+          state
+          | pending: put_pending(state.pending, key, rest),
+            unsure: MapSet.union(state.unsure, MapSet.new(newer))
+        }
+
+        {:keep_state, state,
+         [{{:timeout, {:request, ref}}, :cancel} | reply_actions(:stale, reply)]}
+
+      [{ref, from} | rest] ->
+        pending = put_pending(state.pending, key, rest)
+        state = %{state | pending: pending, unsure: MapSet.delete(state.unsure, ref)}
+
+        {:keep_state, state,
+         [{{:timeout, {:request, ref}}, :cancel} | reply_actions(from, reply)]}
+    end
+  end
+
+  defp reply_actions(:stale, reply) do
+    Logger.debug("Dropped late reply to a timed-out request: #{inspect(reply, limit: 5)}")
+    []
+  end
+
+  defp reply_actions(:internal, _reply), do: []
+  defp reply_actions(:inactivity, _reply), do: [inactivity_timer()]
+  defp reply_actions(from, reply), do: [{:reply, from, reply}]
+
+  defp timeout_actions(:internal, key, _state) do
+    Logger.warning("No answer to #{inspect(key)}")
+    []
+  end
+
+  defp timeout_actions(:inactivity, _key, state) do
+    Logger.warning(
+      "Inactivity check timed out for #{inspect(state.node_id)}, forcing TCP disconnect"
+    )
+
+    @tcp_module.disconnect(state.node_id)
+    [inactivity_timer()]
+  end
+
+  defp timeout_actions(from, _key, _state), do: [{:reply, from, {:error, :timeout}}]
+
+  # Keeps the timed-out entry in its place as :stale for @stale_reply_ttl.
+  defp mark_stale(state, key, ref, from) do
+    pending = Map.update!(state.pending, key, &List.keyreplace(&1, ref, 0, {ref, :stale}))
+    state = %{state | pending: pending}
+
+    {:keep_state, state,
+     [{{:timeout, {:request, ref}}, @stale_reply_ttl, key} | timeout_actions(from, key, state)]}
+  end
+
+  # Removes the entry `ref` and returns who waited for it.
+  defp pop_pending(state, key, ref) do
+    entries = Map.get(state.pending, key, [])
+
+    case List.keytake(entries, ref, 0) do
+      {{^ref, from}, rest} ->
+        pending = put_pending(state.pending, key, rest)
+        {from, %{state | pending: pending, unsure: MapSet.delete(state.unsure, ref)}}
+
+      nil ->
+        {nil, state}
+    end
+  end
+
+  defp put_pending(pending, key, []), do: Map.delete(pending, key)
+  defp put_pending(pending, key, entries), do: Map.put(pending, key, entries)
+
+  # Answers every pending request with `reply` and cancels their timers.
+  defp fail_pending(state, reply) do
+    actions =
+      for {_key, entries} <- state.pending,
+          {ref, from} <- entries,
+          action <- [{{:timeout, {:request, ref}}, :cancel} | failure_actions(from, reply)],
+          do: action
+
+    {%{state | pending: %{}, unsure: MapSet.new()}, actions}
+  end
+
+  defp failure_actions(from, _reply) when from in [:internal, :inactivity, :stale], do: []
+  defp failure_actions(from, reply), do: [{:reply, from, reply}]
+
+  defp inactivity_timer, do: {{:timeout, :inactivity_check}, @inactivity_timeout, nil}
+
+  defp set_active(%{active: active} = state, active), do: state
+
+  defp set_active(state, active) do
+    publish_secop_conn_state(active, state.pubsub_topic)
+    %{state | active: active}
+  end
+
+  # A random (version 4) UUID.
+  defp generate_uuid do
+    <<a::48, _::4, b::12, _::2, c::62>> = :crypto.strong_rand_bytes(16)
+    hex = Base.encode16(<<a::48, 4::4, b::12, 2::2, c::62>>, case: :lower)
+    <<p1::binary-8, p2::binary-4, p3::binary-4, p4::binary-4, p5::binary-12>> = hex
+    Enum.join([p1, p2, p3, p4, p5], "-")
   end
 
   defp publish_descriptive_data_change(state, pubsub_topic) do
@@ -774,234 +789,5 @@ defmodule SecantClient.NodeStatem do
       "new_node",
       {:new_node, pubsub_topic, state}
     )
-  end
-end
-
-defmodule SecantClient.NodeServices do
-  alias SecantClient.{Buffer, NodeStatem, NodeTable, TcpConnection}
-  use Supervisor
-  require Logger
-
-  def start_link(opts) do
-    node_id = {opts[:host], opts[:port]}
-
-    Supervisor.start_link(__MODULE__, opts,
-      name: {:via, Registry, {SecantClient.Registry.NodeServices, node_id}}
-    )
-  end
-
-  def stop(node_id) do
-    case Registry.lookup(SecantClient.Registry.NodeServices, node_id) do
-      [{supervisor_pid, _}] ->
-        Supervisor.stop(supervisor_pid, :normal)
-
-      [] ->
-        {:error, :not_found}
-    end
-  end
-
-  @impl true
-  def init(opts) do
-    node_id = {opts[:host], opts[:port]}
-
-    children = [
-      # Owns the node's ETS table, so values and identity survive restarts
-      # of the processes below
-      {NodeTable.Owner, node_id},
-      # Buffer process for this specific node
-      {Buffer, node_id},
-      # TCP connection for this specific node
-      {TcpConnection, opts},
-      # Main state machine for this node
-      {NodeStatem, opts}
-    ]
-
-    # Use :rest_for_one strategy - if NodeStatem crashes,
-    # restart it but keep TCP connection and buffer
-    # If TCP connection crashes, restart it and NodeStatem
-    Supervisor.init(children, strategy: :rest_for_one)
-  end
-
-  def child_spec(opts) do
-    %{
-      id: {opts[:host], opts[:port]},
-      start: {__MODULE__, :start_link, [opts]},
-      type: :supervisor,
-      restart: :transient,
-      shutdown: :infinity
-    }
-  end
-end
-
-defmodule SecantClient.NodeSupervisor do
-  alias SecantClient.{NodeServices, NodeStatem}
-  # Automatically defines child_spec/1
-  require Logger
-  alias Jason
-  use DynamicSupervisor
-  @reconnect_backoff 5000
-
-  def start_link(init_arg) do
-    DynamicSupervisor.start_link(__MODULE__, init_arg, name: __MODULE__)
-  end
-
-  @impl true
-  def init(_init_arg) do
-    DynamicSupervisor.init(strategy: :one_for_one)
-  end
-
-  def start_child(opts) do
-    DynamicSupervisor.start_child(
-      __MODULE__,
-      {NodeServices, Map.put(opts, :restart, :transient)}
-    )
-  end
-
-  def get_active_nodes() do
-    Registry.select(SecantClient.Registry.NodeStatem, [
-      {{:"$1", :"$2", :"$3"}, [], [{{:"$1", :"$2", :"$3"}}]}
-    ])
-    |> Enum.reduce(%{}, fn {_id, pid, _value}, acc ->
-      case NodeStatem.get_state(pid) do
-        {:ok, state} ->
-          node_id = state.node_id
-
-          Map.put(acc, node_id, state)
-
-        _ ->
-          acc
-      end
-    end)
-  end
-
-  def start_child_from_discovery(ip, _port, discovery_message) do
-    discover_map = Jason.decode!(discovery_message)
-
-    chl_ip = ip |> Tuple.to_list() |> Enum.join(".") |> String.to_charlist()
-
-    node_port = Map.get(discover_map, "port")
-
-    opts = %{
-      host: chl_ip,
-      port: node_port,
-      reconnect_backoff: @reconnect_backoff
-    }
-
-    case Registry.lookup(SecantClient.Registry.NodeStatem, {chl_ip, node_port}) do
-      [] -> DynamicSupervisor.start_child(__MODULE__, {NodeServices, opts})
-      _ -> {:ok, :node_already_running}
-    end
-  end
-end
-
-defmodule SecantClient.NodeTable do
-  require Logger
-
-  @lookup_table :node_table_lookup
-
-  def init_lookup_table do
-    :ets.new(@lookup_table, [:set, :public, :named_table])
-    :ok
-  rescue
-    ArgumentError ->
-      :ok
-  end
-
-  def start(node_id) do
-    case :ets.lookup(@lookup_table, node_id) do
-      [{_, table}] ->
-        if :ets.info(table) != :undefined do
-          {:ok, table}
-        else
-          # Owner process crashed and ETS deleted the table; remove stale entry and recreate.
-          :ets.delete(@lookup_table, node_id)
-          start(node_id)
-        end
-
-      [] ->
-        table = :ets.new(:ets_table, [:set, :public])
-
-        case :ets.insert_new(@lookup_table, {node_id, table}) do
-          true ->
-            {:ok, table}
-
-          false ->
-            :ets.delete(table)
-            get_table(node_id)
-        end
-    end
-  end
-
-  def insert(node_id, key, value) do
-    {:ok, table} = get_table(node_id)
-
-    true = :ets.insert(table, {key, value})
-
-    {:ok, :inserted}
-  end
-
-  def lookup(node_id, key) do
-    with {:ok, table} <- get_table(node_id) do
-      case :ets.lookup(table, key) do
-        [{_, value}] -> {:ok, value}
-        [] -> {:error, :notfound}
-      end
-    end
-  rescue
-    ArgumentError -> {:error, :table_not_found}
-  end
-
-  # Delete data reports of modules and parameters that are not in the description.
-  def prune(node_id, description) do
-    modules = description[:modules] || %{}
-
-    with {:ok, table} <- get_table(node_id) do
-      table
-      |> :ets.match({{:data_report, :"$1", :"$2"}, :_})
-      |> Enum.reject(fn [module, parameter] ->
-        Map.has_key?(get_in(modules, [module, :parameters]) || %{}, parameter)
-      end)
-      |> Enum.each(fn [module, parameter] ->
-        :ets.delete(table, {:data_report, module, parameter})
-      end)
-
-      :ok
-    end
-  rescue
-    ArgumentError -> {:error, :table_not_found}
-  end
-
-  defp get_table(node_id) do
-    case :ets.lookup(@lookup_table, node_id) do
-      [{_, table}] ->
-        {:ok, table}
-
-      [] ->
-        Logger.error("Lookup for node_id #{inspect(node_id)} failed - no table found")
-        {:error, :notfound}
-    end
-  end
-end
-
-defmodule SecantClient.NodeTable.Owner do
-  @moduledoc """
-  Owns a node's ETS table. It runs as the first child of NodeServices,
-  so the table outlives restarts of the TCP connection and the state machine,
-  and is deleted when the node is stopped.
-  """
-
-  alias SecantClient.NodeTable
-  use GenServer
-
-  def start_link(node_id), do: GenServer.start_link(__MODULE__, node_id)
-
-  def child_spec(node_id) do
-    %{id: {__MODULE__, node_id}, start: {__MODULE__, :start_link, [node_id]}}
-  end
-
-  @impl true
-  def init(node_id) do
-    {:ok, _table} = NodeTable.start(node_id)
-    {:ok, node_id}
   end
 end

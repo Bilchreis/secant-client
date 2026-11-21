@@ -1,4 +1,5 @@
 defmodule Mix.Tasks.Secant.Client do
+  @moduledoc "Starts `SecantClient.Supervisor` and runs until stopped."
   use Mix.Task
 
   @shortdoc "Starts SecantClient.Supervisor and runs indefinitely"
