@@ -13,7 +13,7 @@ Add `secant_client` to your list of dependencies in `mix.exs`:
 ```elixir
 def deps do
   [
-    {:secant_client, "~> 0.4.0"}
+    {:secant_client, "~> 0.5.0"}
   ]
 end
 ```
