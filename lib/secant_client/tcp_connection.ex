@@ -1,5 +1,5 @@
 defmodule SecantClient.TcpConnection do
-  alias SecantClient.{Buffer, TcpConnectionBehaviour}
+  alias SecantClient.{Parser, TcpConnectionBehaviour}
 
   require Logger
 
@@ -40,6 +40,8 @@ defmodule SecantClient.TcpConnection do
       host: opts[:host],
       port: opts[:port],
       socket: nil,
+      # Bytes received after the last complete line
+      buffer: "",
       reconnect_backoff: opts[:reconnect_backoff] || 500
     }
 
@@ -73,10 +75,10 @@ defmodule SecantClient.TcpConnection do
     {:keep_state, state, {:next_event, :internal, :connect}}
   end
 
-  def handle_event(:info, {:tcp, _socket, data}, :connected, %{host: host, port: port} = state) do
-    [{buffer_pid, _value}] = Registry.lookup(SecantClient.Registry.Buffer, {host, port})
-    Buffer.receive(buffer_pid, data)
-    {:keep_state, state}
+  # Lines are parsed here, in the order they arrive, so updates of the same
+  # parameter are applied in order.
+  def handle_event(:info, {:tcp, _socket, data}, :connected, state) do
+    {:keep_state, %{state | buffer: handle_data(state.buffer, data, {state.host, state.port})}}
   end
 
   def handle_event(:info, {:tcp_closed, _socket}, :connected, %{host: host, port: port} = state) do
@@ -86,7 +88,8 @@ defmodule SecantClient.TcpConnection do
       for {pid, _} <- entries, do: send(pid, :socket_disconnected)
     end)
 
-    {:next_state, :disconnected, %{state | socket: nil}, {:next_event, :internal, :connect}}
+    {:next_state, :disconnected, %{state | socket: nil, buffer: ""},
+     {:next_event, :internal, :connect}}
   end
 
   def handle_event(
@@ -101,7 +104,8 @@ defmodule SecantClient.TcpConnection do
       for {pid, _} <- entries, do: send(pid, :socket_disconnected)
     end)
 
-    {:next_state, :disconnected, %{state | socket: nil}, {:next_event, :internal, :connect}}
+    {:next_state, :disconnected, %{state | socket: nil, buffer: ""},
+     {:next_event, :internal, :connect}}
   end
 
   def handle_event({:call, from}, {:send, data}, :connected, state) do
@@ -141,7 +145,9 @@ defmodule SecantClient.TcpConnection do
     end)
 
     :gen_statem.reply(from, :ok)
-    {:next_state, :disconnected, %{state | socket: nil}, {:next_event, :internal, :connect}}
+
+    {:next_state, :disconnected, %{state | socket: nil, buffer: ""},
+     {:next_event, :internal, :connect}}
   end
 
   def handle_event({:call, from}, :disconnect, :disconnected, state) do
@@ -162,6 +168,37 @@ defmodule SecantClient.TcpConnection do
   end
 
   ## Helpers
+
+  @doc false
+  # Appends `data` to `buffer`, parses every complete line and returns the
+  # rest. Only `data` is searched for a newline, so a long message arriving in
+  # many packets is not rescanned for each one.
+  def handle_data(buffer, data, node_id) do
+    case :binary.split(data, "\n", [:global]) do
+      [incomplete] ->
+        buffer <> incomplete
+
+      [first | rest] ->
+        parse_line(buffer <> first, node_id)
+        {lines, [incomplete]} = Enum.split(rest, -1)
+        Enum.each(lines, &parse_line(&1, node_id))
+        incomplete
+    end
+  end
+
+  defp parse_line("", _node_id), do: :ok
+
+  # A malformed line must not take down the connection.
+  defp parse_line(line, node_id) do
+    Parser.parse(node_id, line)
+  rescue
+    error ->
+      Logger.error(
+        "Could not parse message from #{inspect(node_id)}: #{Exception.message(error)} " <>
+          "line: #{inspect(line, printable_limit: 200)}"
+      )
+  end
+
   @impl TcpConnectionBehaviour
   def is_connected(node_id) do
     [{conn_pid, _value}] = Registry.lookup(SecantClient.Registry.TcpConnection, node_id)
@@ -187,69 +224,6 @@ defmodule SecantClient.TcpConnection do
 
       [] ->
         {:error, :not_found}
-    end
-  end
-end
-
-defmodule SecantClient.Buffer do
-  @moduledoc "Buffer the data received to parse out statements"
-
-  use GenServer
-  require Logger
-  alias SecantClient.Parser
-
-  @eol <<10>>
-  @initial_state ""
-
-  def start_link(buffer_identifier \\ nil) do
-    state = %{
-      buffer: @initial_state,
-      node_id: buffer_identifier
-    }
-
-    GenServer.start_link(__MODULE__, state,
-      name: {:via, Registry, {SecantClient.Registry.Buffer, buffer_identifier}}
-    )
-  end
-
-  def receive(pid \\ __MODULE__, data) do
-    GenServer.cast(pid, {:receive, data})
-  end
-
-  @impl true
-  def init(buffer) do
-    {:ok, buffer}
-  end
-
-  @impl true
-  def handle_cast({:receive, data}, state) do
-    updated_state = state |> append(data) |> process
-
-    {:noreply, updated_state}
-  end
-
-  defp append(state, ""), do: state
-
-  defp append(%{buffer: buffer} = state, data) do
-    updated_buffer = buffer <> data
-    %{state | buffer: updated_buffer}
-  end
-
-  defp process(%{buffer: buffer, node_id: node_id} = state) do
-    case extract(buffer) do
-      {:statement, updated_buffer, statement} ->
-        Task.start(fn -> Parser.parse(node_id, statement) end)
-        process(%{state | buffer: updated_buffer})
-
-      {:nothing, updated_buffer} ->
-        %{state | buffer: updated_buffer}
-    end
-  end
-
-  defp extract(buffer) do
-    case String.split(buffer, @eol, parts: 2) do
-      [match, rest] -> {:statement, rest, match}
-      [rest] -> {:nothing, rest}
     end
   end
 end

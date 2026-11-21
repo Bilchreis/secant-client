@@ -13,7 +13,6 @@ defmodule SecantClient.Supervisor do
 
     base_children = [
       {Phoenix.PubSub, name: :secant_client_pubsub},
-      {Registry, keys: :unique, name: SecantClient.Registry.Buffer},
       {Registry, keys: :unique, name: SecantClient.Registry.TcpConnection},
       {Registry, keys: :unique, name: SecantClient.Registry.NodeStatem},
       {Registry, keys: :unique, name: SecantClient.Registry.NodePublisher},

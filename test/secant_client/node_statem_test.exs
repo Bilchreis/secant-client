@@ -244,12 +244,108 @@ defmodule SecantClient.NodeStatemTest do
       drive_to_initialized(ctx)
 
       expect(MockTcpConnection, :send_message, fn _id, charlist ->
-        assert String.starts_with?(to_string(charlist), "ping ")
-        send(self(), {:pong, 12_345, %{}})
+        "ping " <> id = charlist |> to_string() |> String.trim()
+        send(self(), {:pong, id, "{}"})
         :ok
       end)
 
-      assert NodeStatem.ping(ctx.node_id) == {:pong, 12_345, %{}}
+      assert {:pong, id, "{}"} = NodeStatem.ping(ctx.node_id)
+      assert is_binary(id)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Replies are matched to their request (issue #12)
+  # ---------------------------------------------------------------------------
+
+  describe "reply matching" do
+    test "a late reply for another parameter does not answer a change", ctx do
+      drive_to_initialized(ctx)
+
+      stub(MockTcpConnection, :send_message, fn _id, charlist ->
+        case to_string(charlist) do
+          # The node does not answer in time
+          "change mod1:target 10\n" -> :ok
+          "change mod2:target 5\n" -> :ok
+          other -> auto_respond(to_charlist(other))
+        end
+
+        :ok
+      end)
+
+      assert NodeStatem.change(ctx.node_id, "mod1", "target", 10) == {:error, :timeout}
+
+      test_pid = self()
+
+      task =
+        Task.async(fn ->
+          send(test_pid, :sent)
+          NodeStatem.change(ctx.node_id, "mod2", "target", 5)
+        end)
+
+      assert_receive :sent
+      Process.sleep(20)
+      # The stale answer for mod1 arrives first, then the real one for mod2.
+      inject(ctx.node_id, {:changed, "mod1", "target", [10, %{}]})
+      inject(ctx.node_id, {:changed, "mod2", "target", [5, %{}]})
+
+      assert Task.await(task) == {:changed, "mod2", "target", [5, %{}]}
+    end
+
+    test "an error reply answers the request with the same specifier", ctx do
+      drive_to_initialized(ctx)
+      stub(MockTcpConnection, :send_message, fn _id, _charlist -> :ok end)
+
+      read = Task.async(fn -> NodeStatem.read(ctx.node_id, "T", "value") end)
+      change = Task.async(fn -> NodeStatem.change(ctx.node_id, "T", "target", 1) end)
+      Process.sleep(20)
+
+      inject(ctx.node_id, {:error_change, "T:target", "BadValue", "too large", %{}})
+      inject(ctx.node_id, {:reply, "T", "value", [1.0, %{}]})
+
+      assert Task.await(change) == {:error, :change, "T:target", "BadValue", "too large", %{}}
+      assert Task.await(read) == {:reply, "T", "value", [1.0, %{}]}
+    end
+
+    test "a pong with another id does not answer a ping", ctx do
+      drive_to_initialized(ctx)
+      stub(MockTcpConnection, :send_message, fn _id, _charlist -> :ok end)
+
+      assert NodeStatem.ping(ctx.node_id) == {:error, :timeout}
+      inject(ctx.node_id, {:pong, "not-the-id", "{}"})
+
+      # Only the statem's own inactivity pings may still be pending.
+      for {_key, entries} <- get_state_data(ctx.node_id).pending, {_ref, from} <- entries do
+        assert from == :inactivity
+      end
+    end
+
+    test "requests keep the statem responsive while they wait", ctx do
+      drive_to_initialized(ctx)
+      stub(MockTcpConnection, :send_message, fn _id, _charlist -> :ok end)
+
+      task = Task.async(fn -> NodeStatem.read(ctx.node_id, "T", "value") end)
+      Process.sleep(20)
+
+      assert %{{:read, "T", "value"} => [_]} = get_state_data(ctx.node_id).pending
+      inject(ctx.node_id, {:reply, "T", "value", [2.0, %{}]})
+      assert Task.await(task) == {:reply, "T", "value", [2.0, %{}]}
+    end
+
+    test "pending requests are answered when the socket drops", ctx do
+      drive_to_initialized(ctx)
+      stub(MockTcpConnection, :send_message, fn _id, _charlist -> :ok end)
+      stub(MockTcpConnection, :is_connected, fn _id -> false end)
+
+      task = Task.async(fn -> NodeStatem.read(ctx.node_id, "T", "value") end)
+      Process.sleep(20)
+      inject(ctx.node_id, :socket_disconnected)
+
+      assert Task.await(task) == {:error, :disconnected}
+    end
+
+    test "calls for an unknown node return {:error, :not_found}" do
+      assert NodeStatem.read({~c"nowhere", 1}, "T", "value") == {:error, :not_found}
     end
   end
 

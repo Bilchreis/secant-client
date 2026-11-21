@@ -94,31 +94,57 @@ defmodule SecantClient.Parser do
     end
   end
 
-  defp data_to_ets(node_id, specifier, data) do
-    {:ok, data_report} = Jason.decode(data, keys: :atoms)
+  # SECoP qualifiers. Listed so their atoms exist before the first data
+  # report is decoded.
+  @qualifiers [:t, :e]
+  @doc false
+  def qualifiers, do: @qualifiers
 
+  # Data and error reports come from the node, so their keys must not create
+  # atoms: keys that are already atoms (qualifiers, struct members named in the
+  # description) become atoms, any other key stays a string.
+  defp decode_report(data), do: Jason.decode(data, keys: &existing_atom_or_string/1)
+
+  defp existing_atom_or_string(key) do
+    String.to_existing_atom(key)
+  rescue
+    ArgumentError -> key
+  end
+
+  defp existing_atom(string) do
+    {:ok, String.to_existing_atom(string)}
+  rescue
+    ArgumentError -> :error
+  end
+
+  defp data_to_ets(node_id, specifier, data, extra_entries \\ []) do
+    {:ok, data_report} = decode_report(data)
     {:ok, module, accessible} = splitSpecifier(specifier)
 
-    {:ok, :inserted} =
-      NodeTable.insert(
-        node_id,
-        {:data_report, String.to_existing_atom(module), String.to_existing_atom(accessible)},
-        data_report
-      )
+    with {:ok, module_atom} <- existing_atom(module),
+         {:ok, accessible_atom} <- existing_atom(accessible) do
+      {:ok, :inserted} =
+        NodeTable.insert(node_id, [
+          {{:data_report, module_atom, accessible_atom}, data_report} | extra_entries
+        ])
 
-    Phoenix.PubSub.broadcast(
-      :secant_client_pubsub,
-      "value_update:#{elem(node_id, 0)}:#{elem(node_id, 1)}",
-      {:value_update, module, accessible, data_report}
-    )
+      Phoenix.PubSub.broadcast(
+        :secant_client_pubsub,
+        "value_update:#{elem(node_id, 0)}:#{elem(node_id, 1)}",
+        {:value_update, module, accessible, data_report}
+      )
+    else
+      :error ->
+        Logger.warning("Data report for undescribed accessible #{specifier} dropped")
+    end
 
     {:ok, module, accessible, data_report}
   end
 
   def update(node_id, specifier, data) do
-    Logger.debug("Update message received. Specifier: #{specifier}, Data: #{data}")
-    data_to_ets(node_id, specifier, data)
-    NodeTable.insert(node_id, :last_update_timestamp, System.monotonic_time(:millisecond))
+    data_to_ets(node_id, specifier, data, [
+      {:last_update_timestamp, System.monotonic_time(:millisecond)}
+    ])
   end
 
   def describe(node_id, specifier, data) do
@@ -197,7 +223,7 @@ defmodule SecantClient.Parser do
   def done(node_id, specifier, data) do
     Logger.debug("Command executed. Specifier: #{specifier}, Data: #{data}")
 
-    {:ok, data_report} = Jason.decode(data, keys: :atoms)
+    {:ok, data_report} = decode_report(data)
 
     {:ok, module, command} = splitSpecifier(specifier)
 
@@ -267,7 +293,7 @@ defmodule SecantClient.Parser do
   end
 
   def error_update(node_id, specifier, data) do
-    {:ok, error_report} = Jason.decode(data, keys: :atoms)
+    {:ok, error_report} = decode_report(data)
 
     Logger.warning(
       "Error update message received. Specifier: #{specifier}, Data: #{inspect(error_report)}"
@@ -275,22 +301,27 @@ defmodule SecantClient.Parser do
 
     {:ok, module, accessible} = splitSpecifier(specifier)
 
-    {:ok, :inserted} =
-      NodeTable.insert(
-        node_id,
-        {:data_report, String.to_existing_atom(module), String.to_existing_atom(accessible)},
-        {:error_report, error_report}
-      )
+    with {:ok, module_atom} <- existing_atom(module),
+         {:ok, accessible_atom} <- existing_atom(accessible) do
+      {:ok, :inserted} =
+        NodeTable.insert(
+          node_id,
+          {:data_report, module_atom, accessible_atom},
+          {:error_report, error_report}
+        )
 
-    Phoenix.PubSub.broadcast(
-      :secant_client_pubsub,
-      "error_update:#{elem(node_id, 0)}:#{elem(node_id, 1)}",
-      {:error_update, module, accessible, error_report}
-    )
+      Phoenix.PubSub.broadcast(
+        :secant_client_pubsub,
+        "error_update:#{elem(node_id, 0)}:#{elem(node_id, 1)}",
+        {:error_update, module, accessible, error_report}
+      )
+    else
+      :error -> Logger.warning("Error report for undescribed accessible #{specifier} dropped")
+    end
   end
 
   def error_response(error_code, node_id, specifier, data) do
-    {:ok, error_report} = Jason.decode(data, keys: :atoms)
+    {:ok, error_report} = decode_report(data)
     error_class = Enum.at(error_report, 0)
     error_text = Enum.at(error_report, 1)
     error_dict = Enum.at(error_report, 2)
