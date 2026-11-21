@@ -6,7 +6,6 @@ defmodule SecantClient.NodeServices do
 
   alias SecantClient.{NodeStatem, NodeTable, TcpConnection}
   use Supervisor
-  require Logger
 
   def start_link(opts) do
     node_id = {opts[:host], opts[:port]}

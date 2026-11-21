@@ -5,7 +5,6 @@ defmodule SecantClient.NodeSupervisor do
 
   alias SecantClient.{NodeServices, NodeStatem}
   # Automatically defines child_spec/1
-  require Logger
   use DynamicSupervisor
   @reconnect_backoff 5000
 
