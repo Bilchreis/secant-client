@@ -98,8 +98,21 @@ defmodule SecantClient.TcpConnectionSocketTest do
     lines = for value <- 1..300, into: "", do: ~s(update tc_mod:value [#{value},{}]\n)
     :ok = :gen_tcp.send(ctx.server, lines)
 
-    # More messages than {:active, N} allows, so the socket is re-armed.
     for value <- 1..300 do
+      assert_receive {:value_update, "tc_mod", "value", [^value, %{}]}, 1_000
+    end
+  end
+
+  test "the socket is re-armed after {:active, N} messages", ctx do
+    :ok = :inet.setopts(ctx.server, nodelay: true)
+
+    # One packet per line, more than the 100 messages of {:active, 100}
+    for value <- 1..250 do
+      :ok = :gen_tcp.send(ctx.server, ~s(update tc_mod:value [#{value},{}]\n))
+      Process.sleep(1)
+    end
+
+    for value <- 1..250 do
       assert_receive {:value_update, "tc_mod", "value", [^value, %{}]}, 1_000
     end
   end

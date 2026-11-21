@@ -59,7 +59,7 @@ defmodule SecantClient.NodeDiscover do
     # Any host can send a datagram to this port: ignore what is not a node's
     # answer instead of crashing.
     case Jason.decode(message) do
-      {:ok, %{"port" => node_port}} when is_integer(node_port) ->
+      {:ok, %{"SECoP" => "node", "port" => node_port}} when node_port in 1..65_535 ->
         Logger.info("Node Discovered at #{:inet.ntoa(ip)}:#{node_port}")
         socketstruct.callback.(ip, port, message)
 

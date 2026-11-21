@@ -88,7 +88,14 @@ defmodule SecantClient.NodeStatem do
     case Registry.lookup(SecantClient.Registry.NodeStatem, node_id) do
       [{pid, _value}] ->
         {_key, _line, timeout} = request_spec(request)
-        :gen_statem.call(pid, request, timeout + @call_margin)
+
+        try do
+          :gen_statem.call(pid, request, timeout + @call_margin)
+        catch
+          # Busy in the handshake, or stopped while the request waited
+          :exit, {:timeout, _} -> {:error, :timeout}
+          :exit, {_reason, _} -> {:error, :not_found}
+        end
 
       [] ->
         {:error, :not_found}
@@ -116,7 +123,11 @@ defmodule SecantClient.NodeStatem do
       idn: nil,
       # Requests waiting for the node's answer: key => [{timer_ref, from}],
       # oldest first. See send_request/4.
-      pending: %{}
+      pending: %{},
+      # Refs of requests whose answer a stale entry may have taken. They do
+      # not go stale when they time out, so one lost answer cannot make
+      # every retry of the same request time out.
+      unsure: MapSet.new()
     }
 
     Logger.info("Starting SEC Node State Machine for: #{opts[:host]}:#{opts[:port]}")
@@ -345,7 +356,8 @@ defmodule SecantClient.NodeStatem do
 
   # No answer within the request timeout. The entry stays in its place in the
   # queue as :stale for @stale_reply_ttl, so a late answer is taken by it and
-  # cannot answer a retry of the same request.
+  # cannot answer a retry of the same request. A request whose answer a stale
+  # entry may already have taken is removed instead, which ends the chain.
   def handle_event({:timeout, {:request, ref}}, key, _state_name, state) do
     case List.keyfind(Map.get(state.pending, key, []), ref, 0) do
       nil ->
@@ -356,14 +368,12 @@ defmodule SecantClient.NodeStatem do
         {:keep_state, state}
 
       {^ref, from} ->
-        pending = Map.update!(state.pending, key, &List.keyreplace(&1, ref, 0, {ref, :stale}))
-        state = %{state | pending: pending}
-
-        {:keep_state, state,
-         [
-           {{:timeout, {:request, ref}}, @stale_reply_ttl, key}
-           | timeout_actions(from, key, state)
-         ]}
+        if MapSet.member?(state.unsure, ref) do
+          {from, state} = pop_pending(state, key, ref)
+          {:keep_state, state, timeout_actions(from, key, state)}
+        else
+          mark_stale(state, key, ref, from)
+        end
     end
   end
 
@@ -453,7 +463,7 @@ defmodule SecantClient.NodeStatem do
       )
       when is_map_key(@error_requests, error_code) do
     request = Map.fetch!(@error_requests, error_code)
-    Logger.error("Error on #{request} request #{specifier}: #{error_text}")
+    Logger.error("Error on #{request} request #{specifier}: #{inspect(error_text)}")
 
     handle_reply(
       state,
@@ -554,7 +564,7 @@ defmodule SecantClient.NodeStatem do
         {:ok, specifier, parsed_description, raw_description}
 
       {:error_describe, specifier, error_class, error_text, error_dict} ->
-        Logger.error("Error on describe request: #{error_text}")
+        Logger.error("Error on describe request: #{inspect(error_text)}")
         {:error, {specifier, error_class, error_text, error_dict}}
     after
       @handshake_timeout -> {:error, :timeout}
@@ -627,8 +637,23 @@ defmodule SecantClient.NodeStatem do
         Logger.debug("Dropped reply without a pending request: #{inspect(reply, limit: 5)}")
         {:keep_state, state}
 
+      # The answer may be the late one of the stale request, or the answer to
+      # a newer request: drop it, and keep the newer ones from going stale.
+      [{ref, :stale} | rest] ->
+        newer = for {newer_ref, from} <- rest, from != :stale, do: newer_ref
+
+        state = %{
+          state
+          | pending: put_pending(state.pending, key, rest),
+            unsure: MapSet.union(state.unsure, MapSet.new(newer))
+        }
+
+        {:keep_state, state,
+         [{{:timeout, {:request, ref}}, :cancel} | reply_actions(:stale, reply)]}
+
       [{ref, from} | rest] ->
-        state = %{state | pending: put_pending(state.pending, key, rest)}
+        pending = put_pending(state.pending, key, rest)
+        state = %{state | pending: pending, unsure: MapSet.delete(state.unsure, ref)}
 
         {:keep_state, state,
          [{{:timeout, {:request, ref}}, :cancel} | reply_actions(from, reply)]}
@@ -660,13 +685,26 @@ defmodule SecantClient.NodeStatem do
 
   defp timeout_actions(from, _key, _state), do: [{:reply, from, {:error, :timeout}}]
 
+  # Keeps the timed-out entry in its place as :stale for @stale_reply_ttl.
+  defp mark_stale(state, key, ref, from) do
+    pending = Map.update!(state.pending, key, &List.keyreplace(&1, ref, 0, {ref, :stale}))
+    state = %{state | pending: pending}
+
+    {:keep_state, state,
+     [{{:timeout, {:request, ref}}, @stale_reply_ttl, key} | timeout_actions(from, key, state)]}
+  end
+
   # Removes the entry `ref` and returns who waited for it.
   defp pop_pending(state, key, ref) do
     entries = Map.get(state.pending, key, [])
 
     case List.keytake(entries, ref, 0) do
-      {{^ref, from}, rest} -> {from, %{state | pending: put_pending(state.pending, key, rest)}}
-      nil -> {nil, state}
+      {{^ref, from}, rest} ->
+        pending = put_pending(state.pending, key, rest)
+        {from, %{state | pending: pending, unsure: MapSet.delete(state.unsure, ref)}}
+
+      nil ->
+        {nil, state}
     end
   end
 
@@ -681,7 +719,7 @@ defmodule SecantClient.NodeStatem do
           action <- [{{:timeout, {:request, ref}}, :cancel} | failure_actions(from, reply)],
           do: action
 
-    {%{state | pending: %{}}, actions}
+    {%{state | pending: %{}, unsure: MapSet.new()}, actions}
   end
 
   defp failure_actions(from, _reply) when from in [:internal, :inactivity, :stale], do: []

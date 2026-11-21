@@ -21,7 +21,9 @@ defmodule SecantClient.TcpConnection do
   @initial_state :disconnected
   # Messages delivered before the socket pauses for the parser to catch up
   @active_n 100
-  @connect_timeout 5_000
+  # Shorter than @call_timeout, so a connected?/1 call that waits for a
+  # connect attempt still gets its answer.
+  @connect_timeout 3_000
   @call_timeout 5_000
 
   ## Public API

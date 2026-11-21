@@ -136,7 +136,7 @@ defmodule SecantClient.NodeStatemTest do
 
   describe "state transitions" do
     test "goes to :disconnected when TcpConnection is not ready at startup", ctx do
-      # Default stub: is_connected = false
+      # Default stub: connected? = false
       start_statem(ctx)
       assert wait_for_state(ctx.node_id, :disconnected, 500) == :ok
     end
@@ -379,6 +379,77 @@ defmodule SecantClient.NodeStatemTest do
       assert Task.await(retry) == {:changed, "mod1", "target", [20, %{}]}
     end
 
+    test "one lost answer does not make every retry time out", ctx do
+      drive_to_initialized(ctx)
+      sent = :counters.new(1, [])
+
+      # The node swallows the first change and answers every later one at once.
+      stub(MockTcpConnection, :send_message, fn _id, charlist ->
+        :counters.add(sent, 1, 1)
+
+        with "change mod1:target " <> value <- charlist |> to_string() |> String.trim(),
+             true <- :counters.get(sent, 1) > 1 do
+          send(self(), {:changed, "mod1", "target", [value, %{}]})
+        end
+
+        :ok
+      end)
+
+      assert NodeStatem.change(ctx.node_id, "mod1", "target", 1) == {:error, :timeout}
+      # Its answer is taken by the stale entry of the first change.
+      assert NodeStatem.change(ctx.node_id, "mod1", "target", 2) == {:error, :timeout}
+      # The chain ends here.
+      assert NodeStatem.change(ctx.node_id, "mod1", "target", 3) ==
+               {:changed, "mod1", "target", ["3", %{}]}
+    end
+
+    test "error replies answer the request of their kind and specifier", ctx do
+      drive_to_initialized(ctx)
+      stub(MockTcpConnection, :send_message, fn _id, _charlist -> :ok end)
+
+      read = Task.async(fn -> NodeStatem.read(ctx.node_id, "T", "value") end)
+      describe = Task.async(fn -> NodeStatem.describe(ctx.node_id) end)
+      activate = Task.async(fn -> NodeStatem.activate(ctx.node_id) end)
+      deactivate = Task.async(fn -> NodeStatem.deactivate(ctx.node_id) end)
+      wait_for_pending(ctx.node_id, {:read, "T", "value"})
+      wait_for_pending(ctx.node_id, :describe)
+      wait_for_pending(ctx.node_id, :activate)
+      wait_for_pending(ctx.node_id, :deactivate)
+
+      inject(ctx.node_id, {:error_deactivate, ".", "Internal", %{"text" => "not a string"}, %{}})
+      inject(ctx.node_id, {:error_activate, ".", "Internal", "no", %{}})
+      inject(ctx.node_id, {:error_describe, ".", "Internal", "no", %{}})
+      inject(ctx.node_id, {:error_read, "T:value", "NoSuchParameter", "no", %{}})
+
+      assert Task.await(read) == {:error, :read, "T:value", "NoSuchParameter", "no", %{}}
+      assert Task.await(describe) == {:error, :describe, ".", "Internal", "no", %{}}
+      assert Task.await(activate) == {:error, :activate, ".", "Internal", "no", %{}}
+
+      assert Task.await(deactivate) ==
+               {:error, :deactivate, ".", "Internal", %{"text" => "not a string"}, %{}}
+    end
+
+    test "error_ping answers the ping with the same id", ctx do
+      drive_to_initialized(ctx)
+      test_pid = self()
+
+      stub(MockTcpConnection, :send_message, fn _id, charlist ->
+        case charlist |> to_string() |> String.trim() do
+          "ping " <> id -> send(test_pid, {:ping_id, id})
+          _ -> :ok
+        end
+
+        :ok
+      end)
+
+      task = Task.async(fn -> NodeStatem.ping(ctx.node_id) end)
+      assert_receive {:ping_id, id}
+      wait_for_pending(ctx.node_id, {:ping, id})
+      inject(ctx.node_id, {:error_ping, id, "Internal", "no", %{}})
+
+      assert Task.await(task) == {:error, :ping, id, "Internal", "no", %{}}
+    end
+
     test "a stale entry expires, so later replies answer again", ctx do
       drive_to_initialized(ctx)
       stub(MockTcpConnection, :send_message, fn _id, _charlist -> :ok end)
@@ -458,16 +529,27 @@ defmodule SecantClient.NodeStatemTest do
 
     test "stays in :initialized after a successful pong response", ctx do
       drive_to_initialized(ctx)
-      # Default stub auto-responds to pings — allow several inactivity cycles.
-      Process.sleep(400)
+      test_pid = self()
+
+      # Answer every ping and count them: the check must be re-armed after
+      # each pong.
+      stub(MockTcpConnection, :send_message, fn _id, cl ->
+        if String.starts_with?(to_string(cl), "ping "), do: send(test_pid, :ping_sent)
+        auto_respond(cl)
+        :ok
+      end)
+
+      assert_receive :ping_sent, 500
+      assert_receive :ping_sent, 500
+      assert_receive :ping_sent, 500
       assert get_state_data(ctx.node_id).state == :initialized
     end
 
     test "triggers reconnect when no pong received within call_timeout", ctx do
       drive_to_initialized(ctx)
 
-      # Ping gets no pong. On timeout, maybe_force_disconnect calls disconnect/1
-      # immediately (no :socket_disconnected in mailbox). Simulate TcpConnection
+      # Ping gets no pong. On the request timeout the statem calls disconnect/1.
+      # Simulate TcpConnection
       # by injecting :socket_disconnected from the disconnect stub.
       stub(MockTcpConnection, :send_message, fn _id, _msg -> :ok end)
       stub(MockTcpConnection, :connected?, fn _id -> false end)
@@ -600,7 +682,7 @@ defmodule SecantClient.NodeStatemTest do
         :ok
       end)
 
-      # After reconnect_timeout (50 ms) the timer fires, is_connected returns
+      # After reconnect_timeout (50 ms) the timer fires, connected? returns
       # true, and the handshake completes.
       assert wait_for_state(ctx.node_id, :initialized, 2_000) == :ok
     end
