@@ -1,4 +1,4 @@
-# SecantClient
+# ![SecantClient](assets/secant-client.svg)
 
 [![Hex.pm](https://img.shields.io/hexpm/v/secant_client.svg)](https://hex.pm/packages/secant_client)
 [![Docs](https://img.shields.io/badge/hex-docs-blue.svg)](https://hexdocs.pm/secant_client)

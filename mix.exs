@@ -3,7 +3,7 @@ defmodule SecantClient.MixProject do
 
   # Bumping this is the release: once it lands on main, the release workflow
   # publishes to hex.pm and creates the v<version> tag and GitHub release.
-  @version "0.5.0"
+  @version "0.5.1"
   @source_url "https://github.com/Bilchreis/secant-client"
 
   def project do
@@ -59,7 +59,9 @@ defmodule SecantClient.MixProject do
   defp docs do
     [
       main: "readme",
-      extras: ["README.md"],
+      extras: ["README.md": [title: "SecantClient"]],
+      logo: "assets/logo.svg",
+      assets: %{"assets" => "assets"},
       source_url: @source_url,
       source_ref: "v#{@version}"
     ]
