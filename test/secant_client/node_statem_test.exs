@@ -979,6 +979,51 @@ defmodule SecantClient.NodeStatemTest do
       assert restarted.description == new_description
     end
 
+    test "the identity does not hold the description a second time", ctx do
+      start_owned_table(ctx)
+      drive_to_initialized(ctx)
+
+      assert {:ok, identity} = NodeTable.lookup(ctx.node_id, :statem_identity)
+      assert Map.keys(identity) |> Enum.sort() == [:description_hash, :equipment_id, :uuid]
+    end
+
+    test "a restarted statem has the stored description before the handshake", ctx do
+      start_owned_table(ctx)
+      drive_to_initialized(ctx)
+      before = get_state_data(ctx.node_id)
+      # As Parser stores them when the description arrives
+      NodeTable.insert(ctx.node_id, :description, minimal_description())
+      NodeTable.insert(ctx.node_id, :raw_description, %{raw: true})
+
+      crash_statem(ctx.node_id)
+      stub(MockTcpConnection, :connected?, fn _id -> false end)
+      start_statem(ctx)
+      :ok = wait_for_state(ctx.node_id, :disconnected)
+
+      restarted = get_state_data(ctx.node_id)
+      assert restarted.uuid == before.uuid
+      assert restarted.description == minimal_description()
+      assert restarted.raw_description == %{raw: true}
+    end
+
+    test "a stored description the statem has not seen is not restored", ctx do
+      start_owned_table(ctx)
+      drive_to_initialized(ctx)
+      before = get_state_data(ctx.node_id)
+      NodeTable.insert(ctx.node_id, :description, description_with(%{T: module_with([:value])}))
+      NodeTable.insert(ctx.node_id, :raw_description, %{raw: true})
+
+      crash_statem(ctx.node_id)
+      stub(MockTcpConnection, :connected?, fn _id -> false end)
+      start_statem(ctx)
+      :ok = wait_for_state(ctx.node_id, :disconnected)
+
+      restarted = get_state_data(ctx.node_id)
+      assert restarted.uuid == before.uuid
+      assert restarted.description == nil
+      assert restarted.raw_description == nil
+    end
+
     test "the first start without a stored identity generates a uuid", ctx do
       start_owned_table(ctx)
       drive_to_initialized(ctx)

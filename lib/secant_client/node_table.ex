@@ -53,6 +53,21 @@ defmodule SecantClient.NodeTable do
     {:ok, :inserted}
   end
 
+  # The node's table, for inserting many entries without looking the table up
+  # for each of them. See insert_into/2.
+  def fetch_table(node_id) do
+    case :ets.lookup(@lookup_table, node_id) do
+      [{_, table}] -> {:ok, table}
+      [] -> :error
+    end
+  end
+
+  def insert_into(table, entries) when is_list(entries) do
+    true = :ets.insert(table, entries)
+
+    {:ok, :inserted}
+  end
+
   def lookup(node_id, key) do
     with {:ok, table} <- get_table(node_id) do
       case :ets.lookup(table, key) do

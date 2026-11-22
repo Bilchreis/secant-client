@@ -3,9 +3,14 @@ defmodule SecantClient.TcpConnection do
   Owns the TCP socket of one SEC node and reconnects when it drops.
 
   Received data is split into lines here and each line is handed to
-  `SecantClient.Parser` in arrival order. The socket runs in `{:active, N}`
-  mode, so a node that floods the connection cannot grow the mailbox without
-  bound: after N messages the socket pauses until they have been parsed.
+  `SecantClient.Parser` in arrival order. The socket runs in `{:active, :once}`
+  mode: it delivers one chunk and pauses until that chunk has been parsed. A
+  node that floods the connection therefore cannot grow the mailbox, and a
+  request to the node waits for one chunk at most, not for a backlog of them.
+
+  A send blocks only when the node has stopped reading for so long that the
+  socket buffers are full. It then fails after `:send_timeout` with
+  `{:error, :timeout}`, and the connection is closed and opened again.
 
   The node's `SecantClient.NodeStatem` is told about the connection with
   `:socket_connected` and `:socket_disconnected` messages.
@@ -19,8 +24,8 @@ defmodule SecantClient.TcpConnection do
   @behaviour TcpConnectionBehaviour
 
   @initial_state :disconnected
-  # Messages delivered before the socket pauses for the parser to catch up
-  @active_n 100
+  # Shorter than @call_timeout, so send_message/2 still gets its answer.
+  @send_timeout 3_000
   # Shorter than @call_timeout, so a connected?/1 call that waits for a
   # connect attempt still gets its answer.
   @connect_timeout 3_000
@@ -86,6 +91,9 @@ defmodule SecantClient.TcpConnection do
       socket: nil,
       # Bytes received after the last complete line
       buffer: "",
+      # The node's table and topics, resolved once for all lines
+      parser: Parser.context({opts[:host], opts[:port]}),
+      send_timeout: opts[:send_timeout] || @send_timeout,
       reconnect_backoff: opts[:reconnect_backoff] || 500
     }
 
@@ -94,7 +102,18 @@ defmodule SecantClient.TcpConnection do
 
   @impl :gen_statem
   def handle_event(:internal, :connect, :disconnected, state) do
-    options = [:binary, active: @active_n, keepalive: true]
+    # nodelay: requests are single short lines, and Nagle's algorithm holds
+    # one back until the node has acknowledged the request before it.
+    # send_timeout_close: a send that timed out may have written part of a
+    # line, so the socket cannot be used any further.
+    options = [
+      :binary,
+      active: :once,
+      keepalive: true,
+      nodelay: true,
+      send_timeout: state.send_timeout,
+      send_timeout_close: true
+    ]
 
     case :gen_tcp.connect(state.host, state.port, options, @connect_timeout) do
       {:ok, socket} ->
@@ -124,12 +143,16 @@ defmodule SecantClient.TcpConnection do
   # parameter are applied in order. Only messages of the current socket are
   # handled; a closed socket can still have messages in the mailbox.
   def handle_event(:info, {:tcp, socket, data}, :connected, %{socket: socket} = state) do
-    {:keep_state, %{state | buffer: handle_data(state.buffer, data, state.node_id)}}
-  end
+    state = %{state | buffer: handle_data(state.buffer, data, state.parser)}
 
-  def handle_event(:info, {:tcp_passive, socket}, :connected, %{socket: socket}) do
-    :ok = :inet.setopts(socket, active: @active_n)
-    :keep_state_and_data
+    case :inet.setopts(socket, active: :once) do
+      :ok ->
+        {:keep_state, state}
+
+      {:error, reason} ->
+        Logger.error("TCP error on #{state.host}:#{state.port}: #{inspect(reason)}")
+        close(state)
+    end
   end
 
   def handle_event(:info, {:tcp_closed, socket}, :connected, %{socket: socket} = state) do
@@ -148,7 +171,17 @@ defmodule SecantClient.TcpConnection do
   end
 
   def handle_event({:call, from}, {:send, data}, :connected, state) do
-    {:keep_state_and_data, {:reply, from, :gen_tcp.send(state.socket, data)}}
+    case :gen_tcp.send(state.socket, data) do
+      {:error, :timeout} ->
+        Logger.error("Send to #{state.host}:#{state.port} timed out, reconnecting")
+        {:next_state, :disconnected, state, actions} = close(state)
+
+        {:next_state, :disconnected, state,
+         [{:reply, from, {:error, :timeout}} | List.wrap(actions)]}
+
+      result ->
+        {:keep_state_and_data, {:reply, from, result}}
+    end
   end
 
   def handle_event({:call, from}, {:send, _data}, :disconnected, _state) do
@@ -193,27 +226,30 @@ defmodule SecantClient.TcpConnection do
   @doc false
   # Appends `data` to `buffer`, parses every complete line and returns the
   # rest. Only `data` is searched for a newline, so a long message arriving in
-  # many packets is not rescanned for each one.
-  def handle_data(buffer, data, node_id) do
+  # many packets is not rescanned for each one. `node` is the node id or its
+  # `Parser.context/1`.
+  def handle_data(buffer, data, node) do
     case :binary.split(data, "\n", [:global]) do
       [incomplete] ->
         buffer <> incomplete
 
       [first | rest] ->
-        parse_line(buffer <> first, node_id)
+        parse_line(buffer <> first, node)
         {lines, [incomplete]} = Enum.split(rest, -1)
-        Enum.each(lines, &parse_line(&1, node_id))
+        Enum.each(lines, &parse_line(&1, node))
         incomplete
     end
   end
 
-  defp parse_line("", _node_id), do: :ok
+  defp parse_line("", _node), do: :ok
 
   # A malformed line must not take down the connection.
-  defp parse_line(line, node_id) do
-    Parser.parse(node_id, line)
+  defp parse_line(line, node) do
+    Parser.parse(node, line)
   rescue
     error ->
+      node_id = Parser.context(node).node_id
+
       Logger.error(
         "Could not parse message from #{inspect(node_id)}: #{Exception.message(error)} " <>
           "line: #{inspect(line, printable_limit: 200)}"
