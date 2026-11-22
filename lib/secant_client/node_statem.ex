@@ -123,6 +123,8 @@ defmodule SecantClient.NodeStatem do
       reconnect_backoff: opts[:reconnect_backoff] || 5000,
       description: nil,
       raw_description: nil,
+      # Hash of the description the uuid stands for. See store_identity/1.
+      description_hash: nil,
       active: false,
       uuid: generate_uuid(),
       error: false,
@@ -260,7 +262,7 @@ defmodule SecantClient.NodeStatem do
         :internal,
         :handshake,
         :connected,
-        %{node_id: node_id, description: description} = state
+        %{node_id: node_id} = state
       ) do
     case send_idn_message(node_id) do
       {:ok, idn} ->
@@ -271,11 +273,18 @@ defmodule SecantClient.NodeStatem do
 
         case send_describe_message(node_id) do
           {:ok, _specifier, parsed_description, raw_description} ->
-            case parsed_description === description do
+            case same_description?(state, parsed_description) do
               # Nothing changed, probably just a prior network disconnect
               true ->
                 Logger.info("Descriptive data constant --> connected & initialized")
-                updated_state = %{state | state: :initialized}
+
+                updated_state =
+                  keep_description(
+                    %{state | state: :initialized},
+                    parsed_description,
+                    raw_description
+                  )
+
                 publish_statechange(updated_state, state.pubsub_topic)
 
                 {:next_state, :initialized, updated_state,
@@ -430,14 +439,14 @@ defmodule SecantClient.NodeStatem do
         :info,
         {:describe, _specifier, parsed_description, raw_description},
         :initialized,
-        %{description: description} = state
+        state
       ) do
     state =
-      case parsed_description === description do
+      case same_description?(state, parsed_description) do
         # Nothing changed, probably just a network disconnect
         true ->
           Logger.info("Descriptive data constant")
-          state
+          keep_description(state, parsed_description, raw_description)
 
         # Description changed update uuid, equipment_id and description
         false ->
@@ -523,6 +532,7 @@ defmodule SecantClient.NodeStatem do
       state
       | description: parsed_description,
         raw_description: raw_description,
+        description_hash: description_hash(parsed_description),
         uuid: generate_uuid(),
         equipment_id: parsed_description[:properties][:equipment_id]
     }
@@ -533,10 +543,25 @@ defmodule SecantClient.NodeStatem do
     updated_state
   end
 
-  @identity_fields [:uuid, :description, :raw_description, :equipment_id]
+  # Whether `description` is the one the uuid stands for. After a restart the
+  # state may have only the hash of that description.
+  defp same_description?(%{description: nil, description_hash: hash}, description)
+       when hash != nil,
+       do: hash == description_hash(description)
 
-  # Stored under its own key: Parser overwrites :description before
-  # this process compares it, so that key cannot serve as the previous one.
+  defp same_description?(%{description: current}, description), do: current === description
+
+  defp keep_description(state, parsed_description, raw_description),
+    do: %{state | description: parsed_description, raw_description: raw_description}
+
+  defp description_hash(description),
+    do: :crypto.hash(:sha256, :erlang.term_to_binary(description, [:deterministic]))
+
+  @identity_fields [:uuid, :equipment_id, :description_hash]
+
+  # The description itself is not stored a second time: the node's table has
+  # it already (Parser stores it), and only its hash is needed to tell
+  # whether the next description is still the one this uuid stands for.
   defp store_identity(state) do
     NodeTable.insert(state.node_id, :statem_identity, Map.take(state, @identity_fields))
   rescue
@@ -547,10 +572,23 @@ defmodule SecantClient.NodeStatem do
     case NodeTable.lookup(state.node_id, :statem_identity) do
       {:ok, identity} ->
         Logger.info("Restored identity #{identity.uuid} for #{state.pubsub_topic}")
-        Map.merge(state, identity)
+        state |> Map.merge(identity) |> restore_description()
 
       {:error, _} ->
         state
+    end
+  end
+
+  # Parser may have stored a description this process has not seen yet, so
+  # the stored one is taken only when it is the one the uuid stands for.
+  # Otherwise the description stays empty until the handshake.
+  defp restore_description(state) do
+    with {:ok, description} <- NodeTable.lookup(state.node_id, :description),
+         true <- description_hash(description) == state.description_hash,
+         {:ok, raw_description} <- NodeTable.lookup(state.node_id, :raw_description) do
+      %{state | description: description, raw_description: raw_description}
+    else
+      _ -> state
     end
   end
 

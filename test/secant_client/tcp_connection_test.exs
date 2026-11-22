@@ -63,6 +63,39 @@ defmodule SecantClient.TcpConnectionTest do
       refute_received {:value_update, _, _, _}
     end
 
+    test "an update with surrounding whitespace is parsed", %{node_id: node_id} do
+      Parser.parse(node_id, ~s(  update tc_mod:value [7,{}]\r))
+      assert_received {:value_update, "tc_mod", "value", [7, %{}]}
+
+      Parser.parse(node_id, ~s(update tc_mod:value [8,{}]\u00A0))
+      assert_received {:value_update, "tc_mod", "value", [8, %{}]}
+    end
+
+    test "a context gives the same result as the node id", %{node_id: node_id} do
+      context = Parser.context(node_id)
+
+      assert Parser.parse(context, "update tc_mod:value [9,{}]") ==
+               Parser.parse(node_id, "update tc_mod:value [9,{}]")
+
+      assert_received {:value_update, "tc_mod", "value", [9, %{}]}
+      assert_received {:value_update, "tc_mod", "value", [9, %{}]}
+
+      Parser.parse(context, ~s(error_update tc_mod:value ["Error","broken",{}]))
+
+      assert NodeTable.lookup(node_id, {:data_report, :tc_mod, :value}) ==
+               {:ok, {:error_report, ["Error", "broken", %{}]}}
+    end
+
+    test "a context made before the node's table exists still stores reports" do
+      node_id = {~c"localhost", System.unique_integer([:positive])}
+      context = Parser.context(node_id)
+      {:ok, _table} = NodeTable.start(node_id)
+
+      Parser.parse(context, "update tc_mod:value [10,{}]")
+
+      assert NodeTable.lookup(node_id, {:data_report, :tc_mod, :value}) == {:ok, [10, %{}]}
+    end
+
     test "an update stores the report and the timestamp", %{node_id: node_id} do
       Parser.parse(node_id, String.trim(update(6)))
 
@@ -87,7 +120,10 @@ defmodule SecantClient.TcpConnectionSocketTest do
     Phoenix.PubSub.subscribe(:secant_client_pubsub, "value_update:localhost:#{port}")
 
     pid =
-      start_supervised!({TcpConnection, [host: ~c"localhost", port: port, reconnect_backoff: 20]})
+      start_supervised!(
+        {TcpConnection,
+         [host: ~c"localhost", port: port, reconnect_backoff: 20, send_timeout: 100]}
+      )
 
     {:ok, server} = :gen_tcp.accept(listen, 1_000)
     on_exit(fn -> :gen_tcp.close(listen) end)
@@ -103,10 +139,10 @@ defmodule SecantClient.TcpConnectionSocketTest do
     end
   end
 
-  test "the socket is re-armed after {:active, N} messages", ctx do
+  test "the socket is re-armed after every packet", ctx do
     :ok = :inet.setopts(ctx.server, nodelay: true)
 
-    # One packet per line, more than the 100 messages of {:active, 100}
+    # One packet per line
     for value <- 1..250 do
       :ok = :gen_tcp.send(ctx.server, ~s(update tc_mod:value [#{value},{}]\n))
       Process.sleep(1)
@@ -127,6 +163,25 @@ defmodule SecantClient.TcpConnectionSocketTest do
 
     assert_receive {:value_update, "tc_mod", "value", [2, %{}]}, 1_000
     refute_received {:value_update, _, _, _}
+  end
+
+  test "a send to a node that stopped reading times out and reconnects", ctx do
+    chunk = :binary.copy("x", 1_000_000)
+
+    # The node never reads, so the buffers fill up and a send blocks.
+    result =
+      Enum.find_value(1..200, fn _ ->
+        case TcpConnection.send_message(ctx.node_id, chunk) do
+          :ok -> nil
+          error -> error
+        end
+      end)
+
+    assert result == {:error, :timeout}
+
+    {:ok, server} = :gen_tcp.accept(ctx.listen, 1_000)
+    :ok = :gen_tcp.send(server, ~s(update tc_mod:value [4,{}]\n))
+    assert_receive {:value_update, "tc_mod", "value", [4, %{}]}, 1_000
   end
 
   test "messages of another socket are ignored", ctx do
