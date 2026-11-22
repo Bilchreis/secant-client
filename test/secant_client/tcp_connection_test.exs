@@ -166,11 +166,13 @@ defmodule SecantClient.TcpConnectionSocketTest do
   end
 
   test "a send to a node that stopped reading times out and reconnects", ctx do
+    # Stand in for the node's statem, which is told when the socket closes
+    {:ok, _} = Registry.register(SecantClient.Registry.NodeStatem, ctx.node_id, nil)
     chunk = :binary.copy("x", 1_000_000)
 
     # The node never reads, so the buffers fill up and a send blocks.
     result =
-      Enum.find_value(1..200, fn _ ->
+      Enum.find_value(1..50, fn _ ->
         case TcpConnection.send_message(ctx.node_id, chunk) do
           :ok -> nil
           error -> error
@@ -178,6 +180,7 @@ defmodule SecantClient.TcpConnectionSocketTest do
       end)
 
     assert result == {:error, :timeout}
+    assert_received :socket_disconnected
 
     {:ok, server} = :gen_tcp.accept(ctx.listen, 1_000)
     :ok = :gen_tcp.send(server, ~s(update tc_mod:value [4,{}]\n))

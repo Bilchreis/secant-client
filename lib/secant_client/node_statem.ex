@@ -446,7 +446,7 @@ defmodule SecantClient.NodeStatem do
         # Nothing changed, probably just a network disconnect
         true ->
           Logger.info("Descriptive data constant")
-          keep_description(state, parsed_description, raw_description)
+          state
 
         # Description changed update uuid, equipment_id and description
         false ->
@@ -581,11 +581,13 @@ defmodule SecantClient.NodeStatem do
 
   # Parser may have stored a description this process has not seen yet, so
   # the stored one is taken only when it is the one the uuid stands for.
-  # Otherwise the description stays empty until the handshake.
+  # Otherwise the description stays empty until the handshake. Parser writes
+  # :description before :raw_description, so they are read in the opposite
+  # order: a raw description newer than the hashed one cannot be taken.
   defp restore_description(state) do
-    with {:ok, description} <- NodeTable.lookup(state.node_id, :description),
-         true <- description_hash(description) == state.description_hash,
-         {:ok, raw_description} <- NodeTable.lookup(state.node_id, :raw_description) do
+    with {:ok, raw_description} <- NodeTable.lookup(state.node_id, :raw_description),
+         {:ok, description} <- NodeTable.lookup(state.node_id, :description),
+         true <- description_hash(description) == state.description_hash do
       %{state | description: description, raw_description: raw_description}
     else
       _ -> state

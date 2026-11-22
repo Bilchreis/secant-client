@@ -8,9 +8,9 @@ defmodule SecantClient.TcpConnection do
   node that floods the connection therefore cannot grow the mailbox, and a
   request to the node waits for one chunk at most, not for a backlog of them.
 
-  A request that cannot be written within `:send_timeout` (the node has
-  stopped reading) fails with `{:error, :timeout}` and the connection is
-  closed and opened again.
+  A send blocks only when the node has stopped reading for so long that the
+  socket buffers are full. It then fails after `:send_timeout` with
+  `{:error, :timeout}`, and the connection is closed and opened again.
 
   The node's `SecantClient.NodeStatem` is told about the connection with
   `:socket_connected` and `:socket_disconnected` messages.

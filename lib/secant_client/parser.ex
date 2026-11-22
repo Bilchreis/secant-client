@@ -38,10 +38,9 @@ defmodule SecantClient.Parser do
     }
   end
 
-  @doc """
-  Parses one line. `node` is the node id, or the node's `context/1` when many
-  lines of the same node are parsed.
-  """
+  # Parses one line. `node` is the node id, or the node's context/1 when many
+  # lines of the same node are parsed.
+  #
   # Updates are nearly all the traffic of an active node, so they skip the
   # general split in parse_trimmed/2. A line they cannot handle goes there.
   def parse(node, "update " <> rest = message) do
